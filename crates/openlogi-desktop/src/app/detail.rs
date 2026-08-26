@@ -33,6 +33,7 @@ use crate::features::mouse::view::MouseModelView;
 use crate::features::pointer::dpi::DpiPanel;
 use crate::features::pointer::smartshift::SmartShiftPanel;
 use crate::features::profile_scope::{AppCatalogPicker, ProfileIconCache, profile_scope_bar};
+use crate::features::touchpad::TouchpadGesturesView;
 use crate::state::{AppState, DeviceRecord, StateEvent};
 use crate::ui::battery::BatteryIndicator;
 use crate::ui::components::{PanelCard, Toggle};
@@ -93,6 +94,7 @@ pub(super) struct DetailPanels<'a> {
     pub camera_preview: &'a gpui::Entity<CameraPreview>,
     pub camera_controls: &'a gpui::Entity<CameraControlsPanel>,
     pub light_panel: &'a gpui::Entity<LightPanel>,
+    pub touchpad_gestures: &'a gpui::Entity<TouchpadGesturesView>,
 }
 
 /// The device-detail workspace below the identity bar: stable navigation rail
@@ -124,6 +126,7 @@ pub(super) fn detail_content(
             camera_tab(panels.camera_preview, panels.camera_controls).into_any_element()
         }
         DetailTab::Light => light_tab(panels.light_panel, cx).into_any_element(),
+        DetailTab::Gestures => gestures_tab(panels.touchpad_gestures).into_any_element(),
         DetailTab::Device => device_tab(cx).into_any_element(),
     };
     let navigation = detail_navigation(tabs, active, cx);
@@ -236,6 +239,7 @@ fn detail_tab_icon(tab: DetailTab) -> &'static str {
         DetailTab::Buttons => "action-icons/mouse-pointer-click.svg",
         DetailTab::ActionsRing => "action-icons/layout-grid.svg",
         DetailTab::Keys => "action-icons/keyboard.svg",
+        DetailTab::Gestures => "action-icons/move.svg",
         DetailTab::Pointer => "action-icons/gauge.svg",
         DetailTab::Lighting | DetailTab::Light => "action-icons/palette.svg",
         DetailTab::Camera => "action-icons/camera.svg",
@@ -280,6 +284,11 @@ fn keys_tab(keyboard_model: &gpui::Entity<FunctionRowView>) -> impl IntoElement 
 
 fn action_ring_tab(panel: &gpui::Entity<ActionRingPanel>) -> impl IntoElement {
     tab_body(ContentWidth::Medium, panel.clone())
+}
+
+/// Gestures tab: the touchpad gesture binding editor.
+fn gestures_tab(panel: &gpui::Entity<TouchpadGesturesView>) -> impl IntoElement {
+    tab_body(ContentWidth::Large, panel.clone()).justify_center()
 }
 
 /// Pointer tab: the DPI panel, the SmartShift wheel controls, and the

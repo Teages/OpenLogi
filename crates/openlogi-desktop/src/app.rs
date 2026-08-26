@@ -24,6 +24,7 @@ use crate::features::mouse::view::MouseModelView;
 use crate::features::pointer::dpi::DpiPanel;
 use crate::features::pointer::smartshift::SmartShiftPanel;
 use crate::features::profile_scope::{AppCatalogPicker, ProfileIconCache};
+use crate::features::touchpad::TouchpadGesturesView;
 use crate::services::assets::AssetResolver;
 use crate::state::{AgentLink, AppState, DeviceRecord, StateEvent};
 use crate::ui::theme::{self, ContentWidth, Typography as _};
@@ -83,6 +84,8 @@ enum DetailTab {
     Camera,
     /// Standalone light controls driven by a raw-HID device driver.
     Light,
+    /// Touchpad gesture bindings, host-classified over `0x6100`.
+    Gestures,
     /// Device info and configuration.
     Device,
 }
@@ -124,6 +127,10 @@ impl DetailTab {
         if matches!(record.kind, DeviceKind::Keyboard) && caps.buttons {
             tabs.push(Self::Keys);
         }
+        // Host-classified touchpad gestures when the pad exposes raw 0x6100.
+        if caps.touchpad_raw_xy {
+            tabs.push(Self::Gestures);
+        }
         if caps.pointer {
             tabs.push(Self::Pointer);
         }
@@ -153,6 +160,7 @@ impl DetailTab {
             Self::Pointer => tr!("Pointer"),
             Self::Lighting | Self::Light => tr!("Lighting"),
             Self::Camera => tr!("Camera"),
+            Self::Gestures => tr!("Gestures"),
             Self::Device => tr!("Device"),
         }
     }
@@ -165,6 +173,7 @@ pub struct AppView {
     mouse_model: Entity<MouseModelView>,
     action_ring_panel: Entity<ActionRingPanel>,
     keyboard_model: Entity<FunctionRowView>,
+    touchpad_gestures: Entity<TouchpadGesturesView>,
     dpi_panel: Entity<DpiPanel>,
     smartshift_panel: Entity<SmartShiftPanel>,
     lighting_panel: Entity<LightingPanel>,
@@ -227,6 +236,7 @@ impl AppView {
         let mouse_model = cx.new(|cx| MouseModelView::new(window, cx));
         let action_ring_panel = cx.new(ActionRingPanel::new);
         let keyboard_model = cx.new(FunctionRowView::new);
+        let touchpad_gestures = cx.new(TouchpadGesturesView::new);
         let dpi_panel = cx.new(DpiPanel::new);
         let smartshift_panel = cx.new(SmartShiftPanel::new);
         let lighting_panel = cx.new(LightingPanel::new);
@@ -287,6 +297,7 @@ impl AppView {
             mouse_model,
             action_ring_panel,
             keyboard_model,
+            touchpad_gestures,
             dpi_panel,
             smartshift_panel,
             lighting_panel,
@@ -600,6 +611,7 @@ impl Render for AppView {
                         mouse_model: &self.mouse_model,
                         action_ring: &self.action_ring_panel,
                         keyboard_model: &self.keyboard_model,
+                        touchpad_gestures: &self.touchpad_gestures,
                         dpi_panel: &self.dpi_panel,
                         smartshift_panel: &self.smartshift_panel,
                         lighting_panel: &self.lighting_panel,
@@ -831,6 +843,7 @@ mod tests {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            touchpad_raw_xy: false,
         });
         // After 0x0005 kind-correction the record has kind=Mouse, not Keyboard.
         let tabs = DetailTab::tabs_for(&record(DeviceKind::Mouse, caps));
@@ -853,6 +866,7 @@ mod tests {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            touchpad_raw_xy: false,
         });
         let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
         assert!(
@@ -873,6 +887,7 @@ mod tests {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            touchpad_raw_xy: false,
         });
         let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
         assert!(tabs.contains(&DetailTab::Keys));

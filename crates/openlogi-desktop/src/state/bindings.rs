@@ -6,6 +6,7 @@ use gpui::App;
 use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection};
 use openlogi_core::bindings::{bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
 use openlogi_core::config::{Config, KeyTrigger};
+use openlogi_core::touchpad::TouchpadGestureId;
 use tracing::debug;
 
 use crate::features::mouse::thumbwheel::{ThumbwheelPair, ThumbwheelPreset};
@@ -165,6 +166,37 @@ impl AppState {
     #[must_use]
     pub fn keyboard_bindings(&self) -> &BTreeMap<KeyTrigger, Action> {
         &self.bindings.keyboard_bindings
+    }
+
+    /// Effective touchpad gesture map for the selected device — every
+    /// vocabulary slot, seeded with defaults. Read straight from config each
+    /// render: fifteen entries, and the panel renders only while visible.
+    #[must_use]
+    pub fn effective_touchpad_gestures(&self) -> BTreeMap<TouchpadGestureId, Action> {
+        let key = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key);
+        openlogi_core::bindings::touchpad_gestures_for(&self.config, key)
+    }
+
+    /// Bind (or, with `action = None`, reset to default) one touchpad gesture
+    /// on the current device. Touchpad gestures are device-global: no per-app
+    /// layer applies.
+    pub fn commit_touchpad_gesture(&mut self, gesture: TouchpadGestureId, action: Option<Action>) {
+        let Some(key) = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key)
+            .map(str::to_string)
+        else {
+            debug!(
+                ?gesture,
+                "no persistent device key — touchpad gesture kept in memory only"
+            );
+            return;
+        };
+        self.config
+            .edit(|config| config.set_touchpad_gesture(&key, gesture, action));
+        self.persist_and_reload("touchpad gesture");
     }
 
     pub(super) fn refresh_binding_projections(&mut self) {
