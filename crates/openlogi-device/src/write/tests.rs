@@ -841,25 +841,65 @@ fn touchpad_responder(
     }
 }
 
-/// One DualXy broadcast with a single touch at `(x, y)`, ending the frame.
-fn tp_dual_xy_event(x: u16, y: u16, finger_count: u8) -> Vec<u8> {
+/// One DualXy broadcast part carrying up to two in-contact touch slots
+/// `(finger_id, x, y)` at timestamp `ts`, plus the frame-level finger count,
+/// button, and end-of-frame flags. Mirrors Casa Touch's measured layout: the
+/// coordinate-status nibble rides the Y high bits, every part repeats the
+/// frame's finger count, and an unused slot stays zeroed with contact 0.
+///
+/// The returned report also honours the status bit decoding, so listed slots
+/// read back `contact_status == 1`.
+fn tp_dual_xy_part(
+    ts: u16,
+    finger_count: u8,
+    button: bool,
+    end_of_frame: bool,
+    touches: &[(u8, u16, u16)],
+) -> Vec<u8> {
     let mut report = vec![0u8; 20];
     report[0] = 0x11;
     report[1] = TP_DEVICE_INDEX;
     report[2] = TP_FEATURE_INDEX;
     report[3] = 0x00; // event sub-id 0, software id 0 (unsolicited)
-    report[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // timestamp
-    let [x_hi, x_lo] = x.to_be_bytes();
-    let [y_hi, y_lo] = y.to_be_bytes();
-    report[6] = x_hi & 0x3f;
-    report[7] = x_lo;
-    report[8] = y_hi & 0x3f;
-    report[9] = y_lo;
-    report[10] = 30; // z
-    report[11] = 5; // area
-    report[12] = 0x01; // finger 0, no button, end of frame
-    report[19] = finger_count & 0x0f;
+
+    let mut payload = [0u8; 16];
+    payload[0..2].copy_from_slice(&ts.to_be_bytes());
+    for (slot, &(id, x, y)) in touches.iter().take(2).enumerate() {
+        let [x_hi, x_lo] = x.to_be_bytes();
+        let [y_hi, y_lo] = y.to_be_bytes();
+        // Top bits of the Y high byte carry the 2-bit contact status; 1 =
+        // in contact.
+        let y_high = (y_hi & 0x3f) | 0x40;
+        let z = 30; // non-zero, to tell listed slots from padding
+        let area = 5;
+        if slot == 0 {
+            payload[2] = x_hi & 0x3f;
+            payload[3] = x_lo;
+            payload[4] = y_high;
+            payload[5] = y_lo;
+            payload[6] = z;
+            payload[7] = area;
+            payload[8] = id << 4 | u8::from(button) << 2 | u8::from(end_of_frame);
+        } else {
+            payload[9] = x_hi & 0x3f;
+            payload[10] = x_lo;
+            payload[11] = y_high;
+            payload[12] = y_lo;
+            payload[13] = z;
+            payload[14] = area;
+            payload[15] = id << 4;
+        }
+    }
+    payload[15] = (payload[15] & 0xf0) | (finger_count & 0x0f);
+
+    let len = 20;
+    report[4..len].copy_from_slice(&payload);
     report
+}
+
+/// One complete single-touch logical frame ending at its first part.
+fn tp_dual_xy_event(x: u16, y: u16, finger_count: u8) -> Vec<u8> {
+    tp_dual_xy_part(0x1234, finger_count, false, true, &[(0, x, y)])
 }
 
 fn is_raw_mode_write(report: &[u8]) -> bool {
@@ -1036,5 +1076,78 @@ async fn touchpad_probe_shutdown_mid_window_still_restores() -> Result<(), Write
     assert!(report.state_after_set.is_some());
     assert_eq!(report.state_restored, Some(RawReportFlags::empty()));
     assert_eq!(state.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn touchpad_probe_suppresses_a_repeated_split_frame() -> Result<(), WriteError> {
+    let state = Arc::new(AtomicU8::new(0));
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder_shared(touchpad_responder(Arc::clone(&state)));
+    let channel = scripted_channel(raw).await;
+
+    let inject = async {
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if handle
+                .written_reports()
+                .iter()
+                .any(|r| is_raw_mode_write(r))
+            {
+                // One three-finger logical frame split over two parts — Casa
+                // Touch's measured shape: every part repeats the frame's
+                // finger count and the end-of-frame part closes the group —
+                // delivered twice, as a resting hand repeats it.
+                for _ in 0..2 {
+                    handle.deliver(tp_dual_xy_part(
+                        10,
+                        3,
+                        false,
+                        false,
+                        &[(0, 100, 200), (1, 300, 400)],
+                    ));
+                    handle.deliver(tp_dual_xy_part(10, 3, false, true, &[(2, 500, 600)]));
+                }
+                // A finger moves: the assembled frame changes, so it records.
+                handle.deliver(tp_dual_xy_part(
+                    11,
+                    3,
+                    false,
+                    false,
+                    &[(0, 100, 200), (1, 300, 400)],
+                ));
+                handle.deliver(tp_dual_xy_part(11, 3, false, true, &[(2, 505, 605)]));
+                return true;
+            }
+        }
+        false
+    };
+    let (report, injected) = tokio::join!(
+        crate::write::diagnostics::probe_touchpad_on_channel(
+            &channel,
+            TP_DEVICE_INDEX,
+            Some(std::time::Duration::from_millis(400)),
+            None,
+        ),
+        inject,
+    );
+    assert!(injected, "the probe never enabled raw mode");
+
+    let report = report?;
+    assert_eq!(report.frames_received, 6);
+    // The verbatim repeat of the split frame is dropped whole; both halves of
+    // each recorded group stay in order.
+    assert_eq!(report.frames.len(), 4);
+    assert!(!report.frames[0].end_of_frame);
+    assert_eq!(
+        (
+            report.frames[0].touch1.x,
+            report.frames[0].touch1.contact_status
+        ),
+        (100, 1)
+    );
+    assert!(report.frames[1].end_of_frame);
+    assert_eq!(report.frames[1].touch1.x, 500);
+    assert_eq!(report.frames[3].touch1.x, 505, "the movement was recorded");
     Ok(())
 }

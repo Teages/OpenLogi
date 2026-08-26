@@ -225,14 +225,15 @@ pub struct TouchpadProbeReport {
     /// The device is free to mask unsupported bits, so the difference between
     /// the requested and confirmed modes is itself a probe finding.
     pub state_after_set: Option<RawReportFlags>,
-    /// Touch states captured while raw mode was on, oldest first. A frame with
-    /// more than two fingers arrives as several events sharing a timestamp;
-    /// the last one carries `end_of_frame`.
+    /// Touch states captured while raw mode was on, oldest first, as complete
+    /// logical frames: each entry is one raw event, and a frame with more than
+    /// two fingers contributes several events sharing a timestamp whose last
+    /// one carries `end_of_frame`.
     ///
-    /// The sensor resends an unchanged contact state at its report rate
-    /// (~130 Hz measured on Casa Touch) while fingers rest, so `frames`
-    /// records each distinct touch/button state once instead of every
-    /// repetition — [`Self::frames_received`] counts what actually arrived.
+    /// The sensor resends an unchanged hand at its report rate (~130 Hz
+    /// measured on Casa Touch), so a logical frame identical to the previous
+    /// one is suppressed — `frames` holds what changed,
+    /// [`Self::frames_received`] counts what actually arrived.
     pub frames: Vec<DualXyData>,
     /// Total `DualXy` events received during the window, repetitions included.
     pub frames_received: usize,
@@ -245,16 +246,41 @@ pub struct TouchpadProbeReport {
 /// gesture rehearsal cannot balloon the report without bound.
 const MAX_PROBE_FRAMES: usize = 20_000;
 
-/// Whether one raw frame repeats the previous contact state verbatim (up to
-/// the timestamp), i.e. the sensor resending a resting hand.
-fn repeats_last_contact(frames: &[DualXyData], frame: &DualXyData) -> bool {
-    frames.last().is_some_and(|last| {
-        last.touch1 == frame.touch1
-            && last.touch2 == frame.touch2
-            && last.button == frame.button
-            && last.finger_count == frame.finger_count
-            && last.end_of_frame == frame.end_of_frame
-    })
+/// Whether a pending group still accepts more events: it runs until the part
+/// that carries `end_of_frame`.
+fn group_open(parts: &[DualXyData]) -> bool {
+    !parts.last().is_some_and(|part| part.end_of_frame)
+}
+
+/// Whether two raw events repeat the same contact state (up to the running
+/// timestamp), i.e. one is the device resending an unchanged hand.
+fn same_contact(a: &DualXyData, b: &DualXyData) -> bool {
+    a.touch1 == b.touch1
+        && a.touch2 == b.touch2
+        && a.button == b.button
+        && a.finger_count == b.finger_count
+        && a.end_of_frame == b.end_of_frame
+}
+
+/// Commit one assembled logical frame into `frames`: appended whole, unless
+/// every part repeats the frame before it — the tail of `frames`, where whole
+/// groups are always contiguous. A resting hand therefore records once and is
+/// then suppressed at report rate until its contact state actually changes.
+fn commit_logical(frames: &mut Vec<DualXyData>, parts: &mut Vec<DualXyData>) {
+    if parts.is_empty() {
+        return;
+    }
+    let n = parts.len();
+    let repeats = frames.len() >= n
+        && frames[frames.len() - n..]
+            .iter()
+            .zip(parts.iter())
+            .all(|(a, b)| same_contact(a, b));
+    if repeats {
+        parts.clear();
+    } else {
+        frames.append(parts);
+    }
 }
 
 /// Probe the HID++ `0x6100 TouchpadRawXy` feature of the device on `route`:
@@ -294,7 +320,7 @@ pub(crate) async fn probe_touchpad_on_channel(
     channel: &Arc<HidppChannel>,
     index: u8,
     sample: Option<Duration>,
-    mut shutdown: Option<oneshot::Receiver<()>>,
+    shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<TouchpadProbeReport, WriteError> {
     let mut device = Device::new(Arc::clone(channel), index)
         .await
@@ -353,40 +379,14 @@ pub(crate) async fn probe_touchpad_on_channel(
     // The EventSource listener is registered in the feature constructor, so
     // frames emitted before this receiver exists would be lost — but raw mode
     // was only just enabled, so there is no earlier frame to lose.
-    let receiver = feature.listen();
-    let deadline = tokio::time::Instant::now() + sample;
-    loop {
-        if tokio::time::Instant::now() >= deadline || report.frames.len() >= MAX_PROBE_FRAMES {
-            break;
-        }
-        // An external shutdown resolves here; with `None` this arm never
-        // wakes and the window (or the frame cap) ends the loop instead.
-        let shutdown_wait = async {
-            match shutdown.as_mut() {
-                Some(rx) => {
-                    let _ = rx.await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(shutdown_wait);
-        tokio::select! {
-            () = &mut shutdown_wait => break,
-            // Window over.
-            () = tokio::time::sleep_until(deadline) => break,
-            event = receiver.recv() => match event {
-                Ok(TouchpadRawEvent::DualXy(frame)) => {
-                    report.frames_received += 1;
-                    if !repeats_last_contact(&report.frames, &frame) {
-                        report.frames.push(frame);
-                    }
-                }
-                Ok(_) => {}
-                // Event source dropped: the channel is going away.
-                Err(_) => break,
-            },
-        }
-    }
+    sample_touch_frames(
+        &feature,
+        &mut report.frames,
+        &mut report.frames_received,
+        sample,
+        shutdown,
+    )
+    .await;
 
     if wrote_mode {
         if let Err(e) = feature.set_raw_report_state(state_before).await {
@@ -408,6 +408,75 @@ pub(crate) async fn probe_touchpad_on_channel(
     match failure {
         Some(e) => Err(e),
         None => Ok(report),
+    }
+}
+
+/// Collect raw touch frames for one sampling window: `frames` gains the
+/// recorded logical frames and `*received` counts every DualXy event,
+/// repetitions included. Ends at the window, at [`MAX_PROBE_FRAMES`], at an
+/// external shutdown, or when the event source drops — whichever first.
+///
+/// Raw events assemble into *logical* frames: a frame with more than two
+/// fingers arrives as several events sharing a timestamp, the last one
+/// carrying `end_of_frame`. Deduplication works on the assembled unit — a
+/// resting multi-finger hand repeats the same 2–3-event group at report rate,
+/// and per-event comparison would let it flood right back.
+async fn sample_touch_frames(
+    feature: &TouchpadRawXyFeature,
+    frames: &mut Vec<DualXyData>,
+    received: &mut usize,
+    sample: Duration,
+    mut shutdown: Option<oneshot::Receiver<()>>,
+) {
+    let events = feature.listen();
+    let deadline = tokio::time::Instant::now() + sample;
+    let mut pending_ts: Option<u16> = None;
+    let mut pending_parts: Vec<DualXyData> = Vec::new();
+    loop {
+        if tokio::time::Instant::now() >= deadline || frames.len() >= MAX_PROBE_FRAMES {
+            commit_logical(frames, &mut pending_parts);
+            break;
+        }
+        // An external shutdown resolves here; with `None` this arm never
+        // wakes and the window (or the frame cap) ends the loop instead.
+        let shutdown_wait = async {
+            match shutdown.as_mut() {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(shutdown_wait);
+        tokio::select! {
+            () = &mut shutdown_wait => {
+                commit_logical(frames, &mut pending_parts);
+                break;
+            }
+            // Window over.
+            () = tokio::time::sleep_until(deadline) => {
+                commit_logical(frames, &mut pending_parts);
+                break;
+            }
+            event = events.recv() => match event {
+                Ok(TouchpadRawEvent::DualXy(frame)) => {
+                    *received += 1;
+                    // A fresh group starts whenever the timestamp moves on or
+                    // the previous group already ended in an end-of-frame;
+                    // otherwise this event continues the pending group.
+                    if !pending_parts.is_empty()
+                        && (Some(frame.timestamp) != pending_ts || !group_open(&pending_parts))
+                    {
+                        commit_logical(frames, &mut pending_parts);
+                    }
+                    pending_ts = Some(frame.timestamp);
+                    pending_parts.push(frame);
+                }
+                Ok(_) => {}
+                // Event source dropped: the channel is going away.
+                Err(_) => break,
+            },
+        }
     }
 }
 

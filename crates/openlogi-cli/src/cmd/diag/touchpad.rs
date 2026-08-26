@@ -114,27 +114,36 @@ fn print_frames(frames: &[DualXyData], frames_received: usize, info: &TouchpadIn
     let end_of_frames = frames.iter().filter(|f| f.end_of_frame).count();
     let max_fingers = frames.iter().map(|f| f.finger_count).max().unwrap_or(0);
     let button_frames = frames.iter().filter(|f| f.button).count();
-    let (x_min, x_max) = observed_range(frames.iter().flat_map(|f| [f.touch1.x, f.touch2.x]));
-    let (y_min, y_max) = observed_range(frames.iter().flat_map(|f| [f.touch1.y, f.touch2.y]));
+    // Only in-contact slots count toward the observed ranges: an unused slot
+    // is an id-preserving, zeroed hover placeholder (measured on Casa Touch),
+    // and counting its (0, 0) would claim fingers swept the pad's corner.
+    let contacts: Vec<(u16, u16)> = frames
+        .iter()
+        .flat_map(|f| [f.touch1, f.touch2])
+        .filter(|p| p.contact_status == 1)
+        .map(|p| (p.x, p.y))
+        .collect();
     println!(
-        "  sampled {seconds}s: {frames_received} frames received, {} distinct contact states \
+        "  sampled {seconds}s: {frames_received} frames received, {} distinct logical frames \
          ({end_of_frames} end-of-frame), max fingers {max_fingers}, button in {button_frames}",
         frames.len(),
     );
-    println!(
-        "  x observed {x_min}..{x_max} of {}, y observed {y_min}..{y_max} of {}",
-        info.x_size, info.y_size,
-    );
+    if contacts.is_empty() {
+        println!("  no in-contact samples — every slot hovered");
+    } else {
+        let x_min = contacts.iter().map(|(x, _)| *x).min().unwrap_or(0);
+        let x_max = contacts.iter().map(|(x, _)| *x).max().unwrap_or(0);
+        let y_min = contacts.iter().map(|(_, y)| *y).min().unwrap_or(0);
+        let y_max = contacts.iter().map(|(_, y)| *y).max().unwrap_or(0);
+        println!(
+            "  x observed {x_min}..{x_max} of {}, y observed {y_min}..{y_max} of {}",
+            info.x_size, info.y_size,
+        );
+    }
     println!("  first frames:");
     for frame in frames.iter().take(PRINTED_FRAMES) {
         println!("    {}", frame_line(frame));
     }
-}
-
-/// The `(min, max)` over one coordinate across every touch slot; `(0, 0)`
-/// stands in for the impossible empty iterator (the caller checked).
-fn observed_range(values: impl Iterator<Item = u16>) -> (u16, u16) {
-    values.fold((u16::MAX, 0), |(lo, hi), x| (lo.min(x), hi.max(x)))
 }
 
 /// One frame as a single diagnostics line: timestamp, finger count, both raw
