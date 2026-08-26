@@ -123,6 +123,7 @@ fn spec_for(plan: &DeviceCapturePlan) -> CaptureSpec {
             .map(|(cid, _)| cid)
             .collect(),
         divert_buttons: plan.divert_buttons.clone(),
+        capture_touchpad: plan.capture_touchpad,
     }
 }
 

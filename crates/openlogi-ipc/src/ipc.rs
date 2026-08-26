@@ -59,7 +59,9 @@ pub use succession::Identity;
 /// v27: `AgentSnapshot::foreground` appended — the frontmost application the
 ///      agent matches per-app profiles against, plus the ones it saw recently.
 /// v28: `Action::HoldShortcut` appended for lifecycle-held keyboard output.
-pub const PROTOCOL_VERSION: u32 = 28;
+/// v29: `Capabilities::touchpad_raw_xy` appended (host-classified touchpad
+///      gestures over HID++ `0x6100`).
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Environment variable through which the agent hands a supervised helper the
 /// run token it will serve, so the helper knows which agent it belongs to

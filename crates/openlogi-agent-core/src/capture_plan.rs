@@ -12,8 +12,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection, default_binding};
-use openlogi_core::bindings::{button_bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
+use openlogi_core::bindings::{
+    button_bindings_for, hidpp_gesture_maps_for, oshook_gestures_for, touchpad_gestures_for,
+};
 use openlogi_core::config::{Config, ThumbwheelSensitivity};
+use openlogi_core::touchpad::TouchpadGestureId;
 use openlogi_hid::DeviceRoute;
 use openlogi_hid::session::gesture::{DIVERTABLE_STANDARD_BUTTONS, GESTURE_SOURCE_BUTTONS};
 
@@ -42,6 +45,14 @@ pub struct DeviceCapturePlan {
     /// This device's effective thumb-wheel sensitivity (device override or the
     /// app-wide default).
     pub thumbwheel_sensitivity: ThumbwheelSensitivity,
+    /// Effective touchpad gesture map (defaults + stored overlay) for devices
+    /// whose pad classifies gestures on the host over `0x6100`.
+    pub touchpad_gestures: BTreeMap<TouchpadGestureId, Action>,
+    /// Whether the capture session should arm the touchpad's raw `0x6100`
+    /// reporting: the device has the feature and at least one gesture is
+    /// bound to a real action. An all-`None` map stays native, so a touchpad
+    /// the user never configured keeps its firmware behavior untouched.
+    pub capture_touchpad: bool,
     /// Capture re-arm generation from the orchestrator. Bumps on reconnect /
     /// system wake so sessions restart even when route and divert set match.
     pub rearm_generation: u64,
@@ -51,12 +62,16 @@ pub struct DeviceCapturePlan {
 pub type SharedCapturePlans = Arc<RwLock<Vec<DeviceCapturePlan>>>;
 
 /// Build one device's plan from the config (per-app effective for `app`).
+/// `touchpad_supported` is the device's measured `touchpad_raw_xy`
+/// capability — an unsupported pad never arms raw reporting no matter what
+/// the config says.
 #[must_use]
 pub fn plan_for_device(
     config: &Config,
     config_key: &str,
     route: DeviceRoute,
     app: Option<&str>,
+    touchpad_supported: bool,
     rearm_generation: u64,
 ) -> DeviceCapturePlan {
     let bindings = button_bindings_for(config, Some(config_key), app);
@@ -107,6 +122,11 @@ pub fn plan_for_device(
             .get(button)
             .is_some_and(|binding| binding.click_action() != default_binding(*button))
     });
+    let touchpad_gestures = if touchpad_supported {
+        touchpad_gestures_for(config, Some(config_key))
+    } else {
+        BTreeMap::new()
+    };
     DeviceCapturePlan {
         config_key: config_key.to_owned(),
         route,
@@ -115,6 +135,11 @@ pub fn plan_for_device(
         divert_buttons,
         thumbwheel_bindings_nondefault,
         thumbwheel_sensitivity: config.thumbwheel_sensitivity(config_key),
+        capture_touchpad: touchpad_supported
+            && touchpad_gestures
+                .values()
+                .any(|action| *action != Action::None),
+        touchpad_gestures,
         rearm_generation,
     }
 }
@@ -142,7 +167,7 @@ mod tests {
         cfg.set_gesture_mode("2b042", ButtonId::GestureButton, true);
         cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             plan.gesture_bindings.contains_key(&ButtonId::GestureButton)
                 && plan.gesture_bindings.contains_key(&ButtonId::HapticPanel),
@@ -171,7 +196,7 @@ mod tests {
             Binding::Single(Action::PrevTab),
         );
 
-        let plan = plan_for_device(&cfg, "2b01a", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b01a", route(), None, false, 0);
         assert!(
             plan.divert_buttons
                 .contains(&(0x005b, ButtonId::WheelTiltLeft)),
@@ -199,7 +224,7 @@ mod tests {
             )),
         );
 
-        let plan = plan_for_device(&cfg, "2b01a", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b01a", route(), None, false, 0);
         assert!(
             plan.divert_buttons
                 .iter()
@@ -216,7 +241,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             plan.gesture_bindings.contains_key(&ButtonId::HapticPanel),
             "a gesture-mode panel must arm the HID++ gesture divert"
@@ -242,7 +267,7 @@ mod tests {
             Binding::Single(Action::Copy),
         );
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             plan.divert_buttons
                 .contains(&(HAPTIC_PANEL_CID, ButtonId::HapticPanel)),
@@ -254,7 +279,7 @@ mod tests {
     fn haptic_panel_default_is_diverted_for_actions_ring() {
         // Default binding is ShowActionsRing — the panel has no native OS path
         // and must be HID++-diverted so the ring can open.
-        let plan = plan_for_device(&Config::default(), "2b042", route(), None, 0);
+        let plan = plan_for_device(&Config::default(), "2b042", route(), None, false, 0);
 
         assert!(
             plan.divert_buttons
@@ -273,7 +298,7 @@ mod tests {
             Binding::Single(Action::None),
         );
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             !plan
                 .divert_buttons
@@ -295,7 +320,7 @@ mod tests {
             Binding::Single(Action::CycleDpiPresets),
         );
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             plan.gesture_bindings.is_empty(),
             "gestures are off — no raw-XY gesture divert"
@@ -316,7 +341,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_gesture_mode("2b042", ButtonId::GestureButton, true);
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             !plan.gesture_bindings.is_empty(),
             "the gesture button owns the gesture role"
@@ -337,13 +362,51 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_gesture_mode("2b042", ButtonId::GestureButton, false);
 
-        let plan = plan_for_device(&cfg, "2b042", route(), None, 0);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, false, 0);
         assert!(
             !plan
                 .divert_buttons
                 .iter()
                 .any(|&(cid, _)| cid == GESTURE_BUTTON_CID),
             "an unbound gesture button must not be captured"
+        );
+    }
+
+    #[test]
+    fn touchpad_arms_on_default_bindings_when_supported() {
+        // The defaults carry real actions (3-finger swipes), so a supported
+        // pad arms raw reporting out of the box — Options+ parity.
+        let plan = plan_for_device(&Config::default(), "2bb00", route(), None, true, 0);
+        assert!(
+            plan.capture_touchpad,
+            "a supported pad with default gestures"
+        );
+        assert_eq!(
+            plan.touchpad_gestures
+                .get(&TouchpadGestureId::ThreeFingerSwipeUp),
+            Some(&Action::MissionControl)
+        );
+    }
+
+    #[test]
+    fn touchpad_stays_native_without_the_capability_or_with_all_none() {
+        // A pad without 0x6100 never arms, whatever the config says…
+        let plan = plan_for_device(&Config::default(), "2bb00", route(), None, false, 0);
+        assert!(!plan.capture_touchpad);
+        assert!(
+            plan.touchpad_gestures.is_empty(),
+            "an unsupported pad carries no gesture map"
+        );
+        // …and a supported pad whose every gesture is explicitly disabled
+        // keeps its firmware behavior — raw reporting is opt-in by use.
+        let mut cfg = Config::default();
+        for gesture in TouchpadGestureId::ALL {
+            cfg.set_touchpad_gesture("2bb00", gesture, Some(Action::None));
+        }
+        let plan = plan_for_device(&cfg, "2bb00", route(), None, true, 0);
+        assert!(
+            !plan.capture_touchpad,
+            "an all-None map must not arm raw mode"
         );
     }
 }

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use openlogi_core::binding::{Action, Binding, ButtonId, default_binding};
 use openlogi_core::config::ThumbwheelSensitivity;
+use openlogi_core::touchpad::TouchpadGestureId;
 use openlogi_hid::CapturedInput;
 use tracing::debug;
 
@@ -116,6 +117,7 @@ impl InputDispatcher {
     }
 
     /// Cancel every input lifecycle retained for one capture session.
+    /// Cancel every input lifecycle retained for one capture session.
     pub(super) fn cancel_session(&mut self, session: &HidppSessionId) {
         self.outputs.cancel_session(session);
         self.wheels.cancel_session(session);
@@ -139,6 +141,9 @@ impl InputDispatcher {
             return;
         };
         match input {
+            CapturedInput::TouchpadGesture(gesture) => {
+                dispatch_touchpad_gesture(&mut self.outputs, key, plan, gesture);
+            }
             CapturedInput::Gesture(button, direction) => {
                 let Some(press) = self.gesture_presses.get(session, button) else {
                     debug!(key, %button, ?direction, "gesture from a canceled button lifecycle — ignored");
@@ -225,6 +230,26 @@ impl InputDispatcher {
                 }
             }
         }
+    }
+}
+
+/// A completed host-classified gesture has no physical press lifecycle — it
+/// fires its action immediately. `Action::None` is an explicit disable, not
+/// a dispatch. A free function so the caller can hold the shared-plan read
+/// guard while dispatching.
+fn dispatch_touchpad_gesture(
+    outputs: &mut super::GestureOutputs,
+    key: &str,
+    plan: &DeviceCapturePlan,
+    gesture: TouchpadGestureId,
+) {
+    if let Some(action) = plan.touchpad_gestures.get(&gesture)
+        && *action != Action::None
+    {
+        debug!(key, %gesture, action = %action.label(), "touchpad gesture → action");
+        outputs.actions.dispatch(action, Some(key));
+    } else {
+        debug!(key, %gesture, "touchpad gesture with no binding — ignored");
     }
 }
 

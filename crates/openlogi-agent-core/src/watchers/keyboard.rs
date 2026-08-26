@@ -140,7 +140,9 @@ fn dispatch_input(
         CapturedInput::ButtonPulse(button) => {
             dispatcher.dispatch_hidpp_button_pulse(session, button, spec.bindings.get(&button));
         }
-        CapturedInput::Gesture(..) | CapturedInput::Scroll { .. } => {}
+        CapturedInput::Gesture(..)
+        | CapturedInput::Scroll { .. }
+        | CapturedInput::TouchpadGesture(..) => {}
     }
 }
 

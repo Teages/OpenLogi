@@ -400,6 +400,7 @@ impl Orchestrator {
                     &dev.config_key,
                     route,
                     self.current_app.as_deref(),
+                    dev.capabilities.is_some_and(|caps| caps.touchpad_raw_xy),
                     rearm_generation,
                 ))
             })
