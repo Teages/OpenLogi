@@ -38,6 +38,7 @@ pub fn apply(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use openlogi_core::binding::{Action, ButtonId, GestureDirection};
+    use openlogi_core::touchpad::TouchpadGestureId;
 
     use crate::features::mouse::thumbwheel::ThumbwheelPreset;
 
@@ -47,6 +48,31 @@ mod tests {
     /// purpose: `rust_i18n`'s locale is a process-global, so splitting them into
     /// separate `#[test]`s would race under the parallel harness. Tests that
     /// must switch the locale for other reasons hold [`super::LOCALE_LOCK`].
+    /// Every non-parameterized enum label plus the touchpad hint has a
+    /// `zh-CN` entry. Extracted from the locale test to keep it under the
+    /// line cap; the process-global locale means it must still run inside
+    /// that test's lock, not as its own `#[test]`.
+    fn exhaustive_label_coverage(covered: &dyn Fn(&str) -> bool) {
+        for b in ButtonId::ALL {
+            assert!(covered(b.label()), "no zh-CN for ButtonId::{b:?}");
+        }
+        for d in GestureDirection::ALL {
+            assert!(covered(d.label()), "no zh-CN for GestureDirection::{d:?}");
+        }
+        for g in TouchpadGestureId::ALL {
+            assert!(covered(g.label()), "no zh-CN for TouchpadGestureId::{g:?}");
+        }
+        assert!(covered("Select a gesture to change its action"));
+        for a in Action::catalog() {
+            assert!(covered(&a.label()), "no zh-CN for Action::{a:?}");
+            assert!(
+                covered(a.category().label()),
+                "no zh-CN for {:?}",
+                a.category()
+            );
+        }
+    }
+
     #[test]
     fn locale_file_resolves_keys() {
         // The accessibility blurb is the longest, most typo-prone key.
@@ -100,20 +126,7 @@ mod tests {
         // `HoldShortcut`) are skipped here and checked explicitly above where
         // needed.
         let covered = |label: &str| rust_i18n::t!(label) != label;
-        for b in ButtonId::ALL {
-            assert!(covered(b.label()), "no zh-CN for ButtonId::{b:?}");
-        }
-        for d in GestureDirection::ALL {
-            assert!(covered(d.label()), "no zh-CN for GestureDirection::{d:?}");
-        }
-        for a in Action::catalog() {
-            assert!(covered(&a.label()), "no zh-CN for Action::{a:?}");
-            assert!(
-                covered(a.category().label()),
-                "no zh-CN for {:?}",
-                a.category()
-            );
-        }
+        exhaustive_label_coverage(&covered);
 
         // Thumb-wheel preset labels are flat full-phrase keys ("Back /
         // Forward", not a composition of the two action names) with reviewed
