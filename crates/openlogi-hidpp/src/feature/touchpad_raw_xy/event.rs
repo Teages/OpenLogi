@@ -12,7 +12,6 @@ use crate::feature::DecodeEvent;
 /// width/height or major/minor data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[non_exhaustive]
 pub struct TouchPoint {
     /// Contact type (2-bit): `0` = finger, others reserved.
     pub contact_type: u8,
@@ -36,7 +35,6 @@ pub struct TouchPoint {
 /// the same `timestamp`; the last sets `end_of_frame`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[non_exhaustive]
 pub struct DualXyData {
     /// Running frame timestamp (unit from
     /// [`TouchpadInfo::timestamp_units`](super::TouchpadInfo::timestamp_units)).

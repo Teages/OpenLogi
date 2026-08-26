@@ -23,6 +23,7 @@ use tokio::sync::oneshot;
 use crate::backend::HidBackend;
 use crate::channel::route::DeviceRoute;
 use crate::reprog_controls::{self, CidFlags, CidInfo, ReprogControlsV4};
+use crate::touchpad::{group_open, same_contact};
 use crate::write::{HidppOperation, WriteError, classify_hidpp_error, open_feature, with_route};
 
 /// Snapshot of one HID++ feature exposed by a device: protocol ID +
@@ -245,22 +246,6 @@ pub struct TouchpadProbeReport {
 /// Upper bound on *recorded* frames a single probe window collects, so a
 /// gesture rehearsal cannot balloon the report without bound.
 const MAX_PROBE_FRAMES: usize = 20_000;
-
-/// Whether a pending group still accepts more events: it runs until the part
-/// that carries `end_of_frame`.
-fn group_open(parts: &[DualXyData]) -> bool {
-    !parts.last().is_some_and(|part| part.end_of_frame)
-}
-
-/// Whether two raw events repeat the same contact state (up to the running
-/// timestamp), i.e. one is the device resending an unchanged hand.
-fn same_contact(a: &DualXyData, b: &DualXyData) -> bool {
-    a.touch1 == b.touch1
-        && a.touch2 == b.touch2
-        && a.button == b.button
-        && a.finger_count == b.finger_count
-        && a.end_of_frame == b.end_of_frame
-}
 
 /// Commit one assembled logical frame into `frames`: appended whole, unless
 /// every part repeats the frame before it — the tail of `frames`, where whole

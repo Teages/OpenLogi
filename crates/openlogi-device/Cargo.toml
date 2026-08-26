@@ -15,6 +15,7 @@ categories = ["hardware-support"]
 # all, and CI's `wasm (portable crates)` job holds this manifest to it. Adding
 # a dependency that cannot build for `wasm32-unknown-unknown` breaks that job.
 [dependencies]
+async-channel = "2.3.1"
 hidpp = { workspace = true }
 openlogi-core = { version = "0.8.1", path = "../openlogi-core", default-features = false }
 openlogi-device-registry = { workspace = true }

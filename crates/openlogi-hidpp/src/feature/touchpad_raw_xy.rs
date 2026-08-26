@@ -63,7 +63,6 @@ pub enum Origin {
 /// [`get_touchpad_info`](TouchpadRawXyFeature::get_touchpad_info).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[non_exhaustive]
 pub struct TouchpadInfo {
     /// Pad width in native coordinate units.
     pub x_size: u16,
