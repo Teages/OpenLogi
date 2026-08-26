@@ -270,10 +270,10 @@ fn four_finger_pinch_in_recognized_by_spread_from_centroid() {
         let (cx, cy) = (1400_i32, 900_i32);
         let d = i32::from(scale);
         let pts = [
-            (cx as i32 - d, cy as i32 - d),
-            (cx as i32 + d, cy as i32 - d),
-            (cx as i32 - d, cy as i32 + d),
-            (cx as i32 + d, cy as i32 + d),
+            (cx - d, cy - d),
+            (cx + d, cy - d),
+            (cx - d, cy + d),
+            (cx + d, cy + d),
         ];
         TouchFrame {
             timestamp: ts,
@@ -281,9 +281,9 @@ fn four_finger_pinch_in_recognized_by_spread_from_centroid() {
                 .iter()
                 .enumerate()
                 .map(|(i, &(x, y))| TouchContact {
-                    finger_id: i as u8,
-                    x: x.clamp(0, i32::from(X) - 1) as u16,
-                    y: y.clamp(0, i32::from(Y) - 1) as u16,
+                    finger_id: u8::try_from(i).unwrap_or(0),
+                    x: u16::try_from(x).unwrap_or(X - 1),
+                    y: u16::try_from(y).unwrap_or(Y - 1),
                 })
                 .collect(),
         }

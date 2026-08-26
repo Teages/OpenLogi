@@ -190,7 +190,7 @@ pub struct DeviceConfig {
     pub disabled_gestures: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
     /// Touchpad gestures → actions, for pads that classify gestures on the
     /// host over HID++ `0x6100` (see
-    /// [`TouchpadGestureId`](crate::touchpad::TouchpadGestureId)). Sparse like
+    /// [`TouchpadGestureId`]). Sparse like
     /// the button map: a gesture absent here falls back to
     /// [`default_touchpad_gesture`](crate::binding::default_touchpad_gesture),
     /// and a stored [`Action::None`] disables that gesture. Per-app overlays

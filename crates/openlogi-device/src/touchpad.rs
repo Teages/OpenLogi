@@ -5,9 +5,9 @@
 //! events sharing a timestamp (the last carrying `end_of_frame`), and a
 //! resting hand re-sends the whole group at report rate.
 //! [`LogicalFrameAssembler`] folds both behaviors away — one
-//! [`TouchFrame`](openlogi_core::touchpad::TouchFrame) out per distinct
+//! [`TouchFrame`] out per distinct
 //! physical frame — so the core
-//! [`TouchpadClassifier`](openlogi_core::touchpad::TouchpadClassifier) sees a
+//! [`TouchpadClassifier`] sees a
 //! clean contact stream. [`TouchpadCaptureState`] is the two glued together:
 //! feed it every event, take a gesture when one commits.
 
@@ -36,7 +36,7 @@ pub(crate) fn same_contact(a: &DualXyData, b: &DualXyData) -> bool {
 }
 
 /// Assembles raw [`DualXyData`] events into logical
-/// [`TouchFrame`](openlogi_core::touchpad::TouchFrame)s.
+/// [`TouchFrame`]s.
 ///
 /// A fresh group starts whenever the timestamp moves on or the previous group
 /// already ended in an `end_of_frame`; otherwise the event continues the
@@ -173,7 +173,7 @@ impl TouchpadCaptureState {
 }
 
 /// The live half of an armed touchpad: its raw-event stream plus the state
-/// classifying it. [`TouchpadArmed`] owns the firmware side (mode write and
+/// classifying it. `TouchpadArmed` owns the firmware side (mode write and
 /// restore); this owns the consuming side once the session starts listening.
 pub struct TouchpadCapture {
     events: async_channel::Receiver<hidpp::feature::touchpad_raw_xy::TouchpadRawEvent>,

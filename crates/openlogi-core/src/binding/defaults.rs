@@ -136,11 +136,17 @@ pub fn default_binding_for(button: ButtonId) -> Binding {
 /// config still dispatches; only the default is inert. Four-finger swipes
 /// have no Options+ default and follow the same rule.
 #[must_use]
+#[expect(
+    clippy::match_same_arms,
+    reason = "the inert arms are distinct vocabulary groups (taps stay firmware-owned, \
+              four-finger swipes have no Options+ default); merging them would tie two \
+              independent default decisions together"
+)]
 pub fn default_touchpad_gesture(gesture: TouchpadGestureId) -> Action {
     match gesture {
-        TouchpadGestureId::TwoFingerTap => Action::None,
-        TouchpadGestureId::ThreeFingerTap => Action::None,
-        TouchpadGestureId::FourFingerTap => Action::None,
+        TouchpadGestureId::TwoFingerTap
+        | TouchpadGestureId::ThreeFingerTap
+        | TouchpadGestureId::FourFingerTap => Action::None,
         TouchpadGestureId::ThreeFingerSwipeUp => Action::MissionControl,
         TouchpadGestureId::ThreeFingerSwipeDown => Action::AppExpose,
         TouchpadGestureId::ThreeFingerSwipeLeft => Action::PreviousDesktop,

@@ -48,7 +48,7 @@ struct TrackedFinger {
 }
 
 impl TrackedFinger {
-    fn landing(contact: &TouchContact) -> Self {
+    fn landing(contact: TouchContact) -> Self {
         Self {
             id: contact.finger_id,
             start_x: i32::from(contact.x),
@@ -81,7 +81,7 @@ pub struct TouchpadClassifier {
     /// Maximum per-finger travel for a tap (pad units).
     tap_travel_max: i32,
     /// Tap time window in frame ticks (see
-    /// [`TAP_MAX_MS`](TAP_MAX_MS)) — computed by the session layer from the
+    /// [`TAP_MAX_MS`]) — computed by the session layer from the
     /// pad's timestamp unit.
     tap_max_ticks: u16,
     /// Fingers currently down, in landing order.
@@ -99,7 +99,7 @@ pub struct TouchpadClassifier {
 impl TouchpadClassifier {
     /// Build a classifier for a pad of `x_size` × `y_size` native units whose
     /// frame timestamps tick `tap_max_ticks` times per
-    /// [`TAP_MAX_MS`](TAP_MAX_MS) window.
+    /// [`TAP_MAX_MS`] window.
     ///
     /// `tap_max_ticks` comes from the pad's
     /// [`TouchpadInfo::timestamp_units`](https://docs.rs/openlogi-hidpp) —
@@ -132,23 +132,20 @@ impl TouchpadClassifier {
             return self.end_stroke(frame.timestamp);
         }
         for contact in &frame.contacts {
-            match self.tracked.iter_mut().find(|t| t.id == contact.finger_id) {
-                Some(tracked) => {
-                    tracked.x = i32::from(contact.x);
-                    tracked.y = i32::from(contact.y);
+            if let Some(tracked) = self.tracked.iter_mut().find(|t| t.id == contact.finger_id) {
+                tracked.x = i32::from(contact.x);
+                tracked.y = i32::from(contact.y);
+            } else {
+                if self.tracked.is_empty() {
+                    // A fresh stroke begins. `fired` should already be
+                    // clear (the empty frame ended the last one); clearing
+                    // again keeps a skipped-empty-frame stream from
+                    // carrying a stale latch across strokes.
+                    self.stroke_start_ts = frame.timestamp;
+                    self.fired = None;
+                    self.stroke_fingers = 0;
                 }
-                None => {
-                    if self.tracked.is_empty() {
-                        // A fresh stroke begins. `fired` should already be
-                        // clear (the empty frame ended the last one); clearing
-                        // again keeps a skipped-empty-frame stream from
-                        // carrying a stale latch across strokes.
-                        self.stroke_start_ts = frame.timestamp;
-                        self.fired = None;
-                        self.stroke_fingers = 0;
-                    }
-                    self.tracked.push(TrackedFinger::landing(contact));
-                }
+                self.tracked.push(TrackedFinger::landing(*contact));
             }
         }
         // A finger absent from a non-empty frame has lifted.
@@ -223,8 +220,9 @@ impl TouchpadClassifier {
             sum_x += t.x - t.start_x;
             sum_y += t.y - t.start_y;
         }
-        let mean_x = sum_x / fingers as i32;
-        let mean_y = sum_y / fingers as i32;
+        let count = i32::from(u8::try_from(fingers).unwrap_or(u8::MAX));
+        let mean_x = sum_x / count;
+        let mean_y = sum_y / count;
         // A straggler pulling against the mean means this is a settle or a
         // pinch, not a swipe — every finger must contribute.
         if self
@@ -270,8 +268,17 @@ impl TouchpadClassifier {
         match self.tracked.len() {
             2 => {
                 let [a, b] = [self.tracked[0], self.tracked[1]];
-                let spread = distance(a.x, a.y, b.x, b.y)
-                    - distance(a.start_x, a.start_y, b.start_x, b.start_y);
+                let spread = distance(
+                    f64::from(a.x),
+                    f64::from(a.y),
+                    f64::from(b.x),
+                    f64::from(b.y),
+                ) - distance(
+                    f64::from(a.start_x),
+                    f64::from(a.start_y),
+                    f64::from(b.start_x),
+                    f64::from(b.start_y),
+                );
                 if spread.abs() < f64::from(self.pinch_min) {
                     return None;
                 }
@@ -308,20 +315,20 @@ impl TrackedFinger {
     }
 }
 
-fn distance(ax: i32, ay: i32, bx: i32, by: i32) -> f64 {
-    let (dx, dy) = (f64::from(ax - bx), f64::from(ay - by));
+fn distance(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let (dx, dy) = (ax - bx, ay - by);
     (dx * dx + dy * dy).sqrt()
 }
 
 /// Mean distance of every finger's point from the group's centroid.
 fn mean_radius(fingers: &[TrackedFinger], point: fn(TrackedFinger) -> (i32, i32)) -> f64 {
     let points: Vec<(i32, i32)> = fingers.iter().copied().map(point).collect();
-    let count = points.len() as f64;
-    let cx = points.iter().map(|&(x, _)| x).sum::<i32>() as f64 / count;
-    let cy = points.iter().map(|&(_, y)| y).sum::<i32>() as f64 / count;
+    let count = f64::from(u32::try_from(points.len()).unwrap_or(u32::MAX));
+    let cx = f64::from(points.iter().map(|&(x, _)| x).sum::<i32>()) / count;
+    let cy = f64::from(points.iter().map(|&(_, y)| y).sum::<i32>()) / count;
     points
         .iter()
-        .map(|&(x, y)| distance(x, y, cx as i32, cy as i32))
+        .map(|&(x, y)| distance(f64::from(x), f64::from(y), cx, cy))
         .sum::<f64>()
         / count
 }

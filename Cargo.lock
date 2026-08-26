@@ -5537,6 +5537,7 @@ dependencies = [
 name = "openlogi-device"
 version = "0.8.1"
 dependencies = [
+ "async-channel",
  "futures-concurrency",
  "futures-lite",
  "openlogi-core",
