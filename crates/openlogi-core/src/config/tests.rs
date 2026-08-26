@@ -585,6 +585,7 @@ fn device_identity_roundtrips_and_is_iterable() {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            touchpad_raw_xy: false,
         },
         light_capabilities: None,
         driver_id: None,

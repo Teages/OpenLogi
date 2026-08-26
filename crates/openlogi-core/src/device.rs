@@ -128,6 +128,12 @@ pub struct Capabilities {
     /// device's `0x1b04` control table.
     #[serde(default)]
     pub haptic_panel: bool,
+    /// Raw multi-touch frames over HID++ `0x6100 TouchpadRawXy`, the data
+    /// source for host-side touchpad gestures (Casa Touch and kin). The pad
+    /// itself gestures in firmware for one and two fingers; this flag is what
+    /// lets the capture session arm raw reporting and classify the rest.
+    #[serde(default)]
+    pub touchpad_raw_xy: bool,
 }
 
 impl Capabilities {
@@ -153,6 +159,7 @@ impl Capabilities {
             thumbwheel: ids.contains(&0x2150),
             haptic_feedback: ids.contains(&0x19b0),
             haptic_panel: false,
+            touchpad_raw_xy: ids.contains(&0x6100),
         }
     }
 
@@ -173,9 +180,16 @@ impl Capabilities {
                 thumbwheel: false,
                 haptic_feedback: false,
                 haptic_panel: false,
+                touchpad_raw_xy: false,
             },
             DeviceKind::Keyboard => Self {
                 lighting: true,
+                ..Self::default()
+            },
+            // A touchpad's defining capability is its touch surface; 0x6100
+            // is how every Logitech touchpad of this generation exposes it.
+            DeviceKind::Touchpad => Self {
+                touchpad_raw_xy: true,
                 ..Self::default()
             },
             _ => Self::default(),
@@ -478,6 +492,7 @@ mod tests {
                     thumbwheel: false,
                     haptic_feedback: false,
                     haptic_panel: false,
+                    touchpad_raw_xy: false,
                 }),
             }],
         }
@@ -545,6 +560,7 @@ mod tests {
                 thumbwheel: true,
                 haptic_feedback: false,
                 haptic_panel: false,
+                touchpad_raw_xy: false,
             }
         );
         assert!(!Capabilities::from_feature_ids(&[0x0003, 0x1b04]).thumbwheel);
@@ -561,6 +577,7 @@ mod tests {
                 thumbwheel: false,
                 haptic_feedback: false,
                 haptic_panel: false,
+                touchpad_raw_xy: false,
             }
         );
         // No driving features → nothing offered.
