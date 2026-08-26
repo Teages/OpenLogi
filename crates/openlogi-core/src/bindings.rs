@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 
 use crate::binding::{
     Action, Binding, ButtonId, GestureDirection, default_binding, default_binding_for,
+    default_touchpad_gesture,
 };
 use crate::config::Config;
+use crate::touchpad::TouchpadGestureId;
 
 /// Effective per-button single-action map for the device `config_key`, with
 /// `app_bundle`'s per-app overlay applied. Unset buttons fall back to
@@ -135,6 +137,35 @@ pub fn oshook_gestures_for(
         .filter_map(|(id, binding)| match binding {
             Binding::Gesture(map) => Some((id, map)),
             Binding::Single(_) | Binding::LongPress(_) => None,
+        })
+        .collect()
+}
+
+/// Effective touchpad gesture map for `config_key`: every vocabulary slot
+/// seeded from [`default_touchpad_gesture`] with the stored map overlaid.
+/// Unlike the button projections this is global-only — per-app overlays are
+/// keyed by [`ButtonId`] and don't reach touchpad gestures (yet).
+///
+/// [`Action::None`] entries are meaningful here (they disable a gesture the
+/// default would fire), so the caller — not this projection — decides what a
+/// `None` means.
+#[must_use]
+pub fn touchpad_gestures_for(
+    config: &Config,
+    config_key: Option<&str>,
+) -> BTreeMap<TouchpadGestureId, Action> {
+    let Some(key) = config_key else {
+        return BTreeMap::new();
+    };
+    let stored = config.touchpad_gestures_for(key);
+    TouchpadGestureId::ALL
+        .into_iter()
+        .map(|gesture| {
+            let action = stored
+                .get(&gesture)
+                .cloned()
+                .unwrap_or_else(|| default_touchpad_gesture(gesture));
+            (gesture, action)
         })
         .collect()
 }
@@ -343,5 +374,53 @@ mod tests {
             hidpp_gesture_maps_for(&cfg, Some("2b042")).is_empty(),
             "a demoted dedicated button must dispatch nothing over HID++"
         );
+    }
+
+    #[test]
+    fn touchpad_projection_seeds_defaults_and_overlays_stored_entries() {
+        // A fresh config projects the full Options+-style default map…
+        let cfg = Config::default();
+        let projected = touchpad_gestures_for(&cfg, Some("2bb00"));
+        assert_eq!(
+            projected.get(&TouchpadGestureId::ThreeFingerSwipeUp),
+            Some(&Action::MissionControl),
+            "the Options+ default must show up without any stored config"
+        );
+        // …and every vocabulary slot is present, so the GUI list is total.
+        assert_eq!(projected.len(), TouchpadGestureId::ALL.len());
+
+        // A stored entry overrides its default, and an explicit None disables.
+        let mut cfg = Config::default();
+        cfg.set_touchpad_gesture(
+            "2bb00",
+            TouchpadGestureId::ThreeFingerSwipeUp,
+            Some(Action::Copy),
+        );
+        cfg.set_touchpad_gesture("2bb00", TouchpadGestureId::FourFingerPinchOut, None);
+        cfg.set_touchpad_gesture(
+            "2bb00",
+            TouchpadGestureId::FourFingerPinchIn,
+            Some(Action::None),
+        );
+        let projected = touchpad_gestures_for(&cfg, Some("2bb00"));
+        assert_eq!(
+            projected.get(&TouchpadGestureId::ThreeFingerSwipeUp),
+            Some(&Action::Copy)
+        );
+        // Clearing the Launchpad slot falls back to its default…
+        assert_eq!(
+            projected.get(&TouchpadGestureId::FourFingerPinchOut),
+            Some(&Action::LaunchpadShow)
+        );
+        // …while a stored None is an explicit disable, not a fallback.
+        assert_eq!(
+            projected.get(&TouchpadGestureId::FourFingerPinchIn),
+            Some(&Action::None)
+        );
+    }
+
+    #[test]
+    fn touchpad_projection_is_empty_without_a_device_key() {
+        assert!(touchpad_gestures_for(&Config::default(), None).is_empty());
     }
 }

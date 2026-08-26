@@ -43,6 +43,7 @@ use crate::binding::{
 };
 use crate::device_order::PhysicalDeviceKey;
 use crate::hid::Dpi;
+use crate::touchpad::TouchpadGestureId;
 #[cfg(feature = "fs")]
 use settings::GestureOwner;
 /// The schema version the current build produces. Bumped whenever the
@@ -164,6 +165,43 @@ impl Config {
             .get(device_key)
             .map(|d| d.bindings.clone())
             .unwrap_or_default()
+    }
+
+    /// Returns the touchpad gesture map stored for `device_key`, or an empty
+    /// map when none is committed. Sparse by design — the effective map
+    /// (with defaults) is [`touchpad_gestures_for`](crate::bindings::touchpad_gestures_for).
+    #[must_use]
+    pub fn touchpad_gestures_for(&self, device_key: &str) -> BTreeMap<TouchpadGestureId, Action> {
+        self.devices
+            .get(device_key)
+            .map(|d| d.touchpad_gestures.clone())
+            .unwrap_or_default()
+    }
+
+    /// Records (or, with `action = None`, clears) the binding for one
+    /// touchpad gesture on `device_key`, creating the device entry if needed.
+    /// A cleared entry falls back to
+    /// [`default_touchpad_gesture`](crate::binding::default_touchpad_gesture);
+    /// storing [`Action::None`] explicitly is what disables a gesture.
+    pub fn set_touchpad_gesture(
+        &mut self,
+        device_key: &str,
+        gesture: TouchpadGestureId,
+        action: Option<Action>,
+    ) {
+        let gestures = &mut self
+            .devices
+            .entry(device_key.to_string())
+            .or_default()
+            .touchpad_gestures;
+        match action {
+            Some(action) => {
+                gestures.insert(gesture, action);
+            }
+            None => {
+                gestures.remove(&gesture);
+            }
+        }
     }
 
     /// Records `binding` for `button` on `device_key`, creating the device

@@ -13,6 +13,7 @@ use super::settings::{
 use crate::binding::{Action, ActionRingConfig, Binding, ButtonId, GestureDirection};
 use crate::device::{Capabilities, DeviceKind, DeviceModelInfo, LightCapabilities};
 use crate::hid::Dpi;
+use crate::touchpad::TouchpadGestureId;
 
 /// Last-known identity of a device, captured while it was online so the UI can
 /// render its card and the *correct* config panels before any live HID++ probe
@@ -187,6 +188,15 @@ pub struct DeviceConfig {
     /// button is a [`Binding::Single`] of its former `Click`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub disabled_gestures: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
+    /// Touchpad gestures → actions, for pads that classify gestures on the
+    /// host over HID++ `0x6100` (see
+    /// [`TouchpadGestureId`](crate::touchpad::TouchpadGestureId)). Sparse like
+    /// the button map: a gesture absent here falls back to
+    /// [`default_touchpad_gesture`](crate::binding::default_touchpad_gesture),
+    /// and a stored [`Action::None`] disables that gesture. Per-app overlays
+    /// don't apply to touchpad gestures (yet).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub touchpad_gestures: BTreeMap<TouchpadGestureId, Action>,
     /// Per-application binding overlays (P1.4). Keyed by bundle identifier
     /// (e.g. `"com.microsoft.VSCode"` on macOS). When the foreground app's
     /// id matches a key here, those bindings take precedence; anything not
@@ -355,6 +365,7 @@ impl Default for DeviceConfig {
             links: BTreeMap::new(),
             bindings: BTreeMap::new(),
             disabled_gestures: BTreeMap::new(),
+            touchpad_gestures: BTreeMap::new(),
             per_app_bindings: BTreeMap::new(),
             action_ring: ActionRingConfig::default(),
             dpi_presets: Vec::new(),
@@ -454,6 +465,9 @@ struct RawDeviceConfig {
     /// v4 stash of turned-off gesture maps (see [`DeviceConfig::disabled_gestures`]).
     #[serde(default)]
     disabled_gestures: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
+    /// See [`DeviceConfig::touchpad_gestures`].
+    #[serde(default)]
+    touchpad_gestures: BTreeMap<TouchpadGestureId, Action>,
     /// Legacy v1 per-button single bindings.
     #[serde(default)]
     button_bindings: BTreeMap<ButtonId, Action>,
@@ -535,6 +549,7 @@ impl From<RawDeviceConfig> for DeviceConfig {
             links: raw.links,
             bindings,
             disabled_gestures: raw.disabled_gestures,
+            touchpad_gestures: raw.touchpad_gestures,
             per_app_bindings: raw.per_app_bindings,
             action_ring: raw.action_ring,
             dpi_presets: raw.dpi_presets,
