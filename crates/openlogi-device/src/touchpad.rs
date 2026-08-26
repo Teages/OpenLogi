@@ -344,62 +344,57 @@ mod tests {
     fn end_to_end_three_finger_swipe_through_the_capture_state() {
         // DualXy events in, TouchpadGestureId out — the shape the session's
         // select loop drives. Casa Touch geometry, three fingers sweeping
-        // right past the swipe minimum (2775/6 = 462). The trailing slot of
-        // each 3-finger frame is the reserved empty hover placeholder.
-        // Commit is lazy, so the swipe surfaces on the event *after* the
-        // frame that crossed the threshold — here, the lift (empty frame).
-        let empty = |ts: u16| part(ts, hover(touch(0, 0, 0)), hover(touch(0, 0, 0)), 0, true);
+        // right 40 units per frame: five co-directed frames spanning ≥50 ms
+        // commit the swipe. The trailing slot of each 3-finger frame is the
+        // reserved empty hover placeholder; assembly is lazy, so each frame
+        // surfaces on the event *after* its closing part.
         let mut state = TouchpadCaptureState::new(2775, 1786, 1);
+        let feed_frame = |state: &mut TouchpadCaptureState, k: u16| {
+            let ts = 100 + 125 * k;
+            let x = 600 + 40 * k;
+            // The opening part is what hands the *previous* frame to the
+            // classifier (lazy assembly), so its result must flow through.
+            let opening = state.feed(part(ts, touch(0, x, 800), touch(1, x + 20, 860), 3, false));
+            opening.or_else(|| {
+                state.feed(part(
+                    ts,
+                    touch(2, x + 40, 920),
+                    hover(touch(0, 0, 0)),
+                    3,
+                    true,
+                ))
+            })
+        };
+        // Landing frame (k=0).
+        let _ = feed_frame(&mut state, 0);
+        // Five sweeping frames: k=1..5. The fifth crosses every gate; the
+        // sixth frame's assembly hands the fifth frame's result over, so
+        // the gesture surfaces one feed later (lazy commit).
+        let mut results = Vec::new();
+        for k in 1..=6_u16 {
+            results.push(feed_frame(&mut state, k));
+        }
         assert_eq!(
-            state.feed(part(100, touch(0, 600, 800), touch(1, 620, 860), 3, false)),
-            None
-        );
-        assert_eq!(
-            state.feed(part(
-                100,
-                touch(2, 640, 920),
-                hover(touch(0, 0, 0)),
-                3,
-                true
-            )),
-            None,
-            "the landing frame must not commit anything"
-        );
-        // Slide all three right by 500 units across two frames.
-        assert_eq!(
-            state.feed(part(
-                400,
-                touch(0, 1100, 800),
-                touch(1, 1120, 860),
-                3,
-                false
-            )),
-            None
-        );
-        assert_eq!(
-            state.feed(part(
-                400,
-                touch(2, 1140, 920),
-                hover(touch(0, 0, 0)),
-                3,
-                true
-            )),
-            None,
-            "the crossing frame itself is still pending"
-        );
-        assert_eq!(
-            state.feed(empty(700)),
-            Some(TouchpadGestureId::ThreeFingerSwipeRight)
+            results,
+            vec![
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(TouchpadGestureId::ThreeFingerSwipeRight)
+            ],
+            "the swipe commits on the fifth consistent frame, surfacing one feed later"
         );
     }
 
     #[test]
     fn tap_window_converts_timestamp_units_to_ticks() {
-        // 1 × 0.1 ms ticks: 250 ms = 2500 ticks. 2 × 0.1 ms: 1250.
-        assert_eq!(tap_max_ticks(1), 2500);
-        assert_eq!(tap_max_ticks(2), 1250);
-        assert_eq!(tap_max_ticks(10), 250);
+        // 1 × 0.1 ms ticks: 200 ms = 2000 ticks. 2 × 0.1 ms: 1000.
+        assert_eq!(tap_max_ticks(1), 2000);
+        assert_eq!(tap_max_ticks(2), 1000);
+        assert_eq!(tap_max_ticks(10), 200);
         // A zero unit field degenerates to the 0.1 ms reading, not /0.
-        assert_eq!(tap_max_ticks(0), 2500);
+        assert_eq!(tap_max_ticks(0), 2000);
     }
 }
