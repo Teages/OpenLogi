@@ -25,7 +25,7 @@ use openlogi_device::inventory::{Enumerator, InventoryError};
 use openlogi_device::pairing::PairingReceiver;
 use openlogi_device::write::{
     self as device, Dpi, DpiInfo, FeatureEntry, FirmwareEntity, HapticWaveform, LightingMethod,
-    LitraModel, ReprogControlEntry, ScrollResolution, ScrollWheelMode,
+    LitraModel, ReprogControlEntry, ScrollResolution, ScrollWheelMode, TouchpadProbeReport,
 };
 
 /// This host's HID stack.
@@ -181,6 +181,19 @@ pub async fn dump_reprog_controls(
 /// Read the raw battery report of the device `route` reaches.
 pub async fn read_battery_raw(route: &DeviceRoute) -> Result<String, WriteError> {
     device::read_battery_raw(&*native_backend(), route).await
+}
+
+/// Probe the `0x6100 TouchpadRawXy` feature of the touchpad `route` reaches,
+/// sampling raw touch frames for `sample` when given. The device's raw-report
+/// mode is restored before returning — including when `shutdown` resolves
+/// mid-window, so a Ctrl-C handler can stop a probe without stranding the
+/// touchpad in raw mode.
+pub async fn probe_touchpad(
+    route: &DeviceRoute,
+    sample: Option<std::time::Duration>,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<TouchpadProbeReport, WriteError> {
+    device::probe_touchpad(&*native_backend(), route, sample, shutdown).await
 }
 
 /// An enumerator over this host's HID stack, with a memory-only probe cache.

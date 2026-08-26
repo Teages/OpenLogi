@@ -759,3 +759,282 @@ async fn a_channel_failure_aborts_the_dump_instead_of_blaming_the_firmware() {
         "the dump stops at the failure rather than timing out per entity"
     );
 }
+
+// --- TouchpadRawXy probe (0x6100) -------------------------------------------
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The scripted touchpad's assigned `0x6100` feature index, version, and pad
+/// description. A Casa Touch class device: 4 tracked fingers, upper-left
+/// origin, 90 dpi sensor.
+const TP_FEATURE_INDEX: u8 = 0x0d;
+const TP_DEVICE_INDEX: u8 = 1;
+
+/// Builds a HID++ response echoing `request`'s header with `payload`.
+fn tp_response(request: &[u8], payload: [u8; 16], long: bool) -> Vec<u8> {
+    let mut response = vec![0u8; if long { 20 } else { 7 }];
+    response[0] = if long { 0x11 } else { 0x10 };
+    response[1..4].copy_from_slice(&request[1..4]);
+    let payload_len = response.len() - 4;
+    response[4..].copy_from_slice(&payload[..payload_len]);
+    response
+}
+
+/// A touchpad that reports raw mode `state` and answers info reads; the mode
+/// write is acked and changes the read-back value, like the firmware's
+/// volatile setting would.
+fn touchpad_responder(
+    state: Arc<AtomicU8>,
+) -> impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static {
+    move |request: &[u8]| {
+        if request.len() < 7 || !matches!(request[0], 0x10 | 0x11) {
+            return None;
+        }
+        let feature_index = request[2];
+        let function = request[3] >> 4;
+        let mut payload = [0u8; 16];
+        let long = match (feature_index, function) {
+            // Root ping used by Device::new.
+            (0x00, 0x01) => {
+                payload[0] = 4;
+                false
+            }
+            // Root feature lookup: only 0x6100 is present, at version 1
+            // (Casa Touch's answer in issue #1036).
+            (0x00, 0x00) => {
+                let feature_id = u16::from_be_bytes([request[4], request[5]]);
+                if feature_id != 0x6100 {
+                    return None;
+                }
+                payload[0] = TP_FEATURE_INDEX;
+                payload[2] = 1;
+                false
+            }
+            // GetTouchpadInfo.
+            (TP_FEATURE_INDEX, 0x00) => {
+                payload[0..2].copy_from_slice(&5500u16.to_be_bytes());
+                payload[2..4].copy_from_slice(&3200u16.to_be_bytes());
+                payload[4] = 0x0f;
+                payload[5] = 0x0f;
+                payload[6] = 10;
+                payload[7] = 4;
+                payload[8] = 3; // Origin::UpperLeft
+                payload[12] = 1;
+                payload[13..15].copy_from_slice(&90u16.to_be_bytes());
+                true
+            }
+            // GetRawReportState.
+            (TP_FEATURE_INDEX, 0x01) => {
+                payload[0] = state.load(Ordering::SeqCst);
+                false
+            }
+            // SetRawReportState: store, ack by echo.
+            (TP_FEATURE_INDEX, 0x02) => {
+                state.store(request[4], Ordering::SeqCst);
+                payload[0] = request[4];
+                false
+            }
+            _ => return None,
+        };
+        Some(tp_response(request, payload, long))
+    }
+}
+
+/// One DualXy broadcast with a single touch at `(x, y)`, ending the frame.
+fn tp_dual_xy_event(x: u16, y: u16, finger_count: u8) -> Vec<u8> {
+    let mut report = vec![0u8; 20];
+    report[0] = 0x11;
+    report[1] = TP_DEVICE_INDEX;
+    report[2] = TP_FEATURE_INDEX;
+    report[3] = 0x00; // event sub-id 0, software id 0 (unsolicited)
+    report[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // timestamp
+    let [x_hi, x_lo] = x.to_be_bytes();
+    let [y_hi, y_lo] = y.to_be_bytes();
+    report[6] = x_hi & 0x3f;
+    report[7] = x_lo;
+    report[8] = y_hi & 0x3f;
+    report[9] = y_lo;
+    report[10] = 30; // z
+    report[11] = 5; // area
+    report[12] = 0x01; // finger 0, no button, end of frame
+    report[19] = finger_count & 0x0f;
+    report
+}
+
+fn is_raw_mode_write(report: &[u8]) -> bool {
+    report[0] == 0x10 && report[2] == TP_FEATURE_INDEX && report[3] >> 4 == 0x02
+}
+
+#[tokio::test]
+async fn touchpad_probe_reads_pad_characteristics_without_sampling() -> Result<(), WriteError> {
+    let state = Arc::new(AtomicU8::new(0));
+    let (raw, handle) = ScriptedRawHidChannel::with_responder_shared(touchpad_responder(state));
+    let channel = scripted_channel(raw).await;
+
+    let report =
+        crate::write::diagnostics::probe_touchpad_on_channel(&channel, TP_DEVICE_INDEX, None, None)
+            .await?;
+
+    assert_eq!(report.feature_version, 1);
+    assert_eq!((report.info.x_size, report.info.y_size), (5500, 3200));
+    assert_eq!(report.info.max_finger_count, 4);
+    assert_eq!(
+        report.info.origin,
+        hidpp::feature::touchpad_raw_xy::Origin::UpperLeft
+    );
+    assert_eq!(report.info.dpi, 90);
+    assert_eq!(report.state_before.bits(), 0);
+    assert!(report.state_after_set.is_none());
+    assert!(report.frames.is_empty());
+    assert!(report.state_restored.is_none());
+    assert!(
+        !handle
+            .written_reports()
+            .iter()
+            .any(|r| is_raw_mode_write(r)),
+        "a read-only probe never writes the raw-report mode"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn touchpad_probe_samples_frames_and_restores_the_mode() -> Result<(), WriteError> {
+    let state = Arc::new(AtomicU8::new(0));
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder_shared(touchpad_responder(Arc::clone(&state)));
+    let channel = scripted_channel(raw).await;
+
+    // Inject three frames once the probe's raw-mode write lands, and let the
+    // probe run to its window end alongside the injector. The first two are
+    // byte-identical — a resting hand, which the sensor resends at ~130 Hz —
+    // and must record as one contact state.
+    let inject = async {
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if handle
+                .written_reports()
+                .iter()
+                .any(|r| is_raw_mode_write(r))
+            {
+                handle.deliver(tp_dual_xy_event(100, 200, 1));
+                handle.deliver(tp_dual_xy_event(100, 200, 1));
+                handle.deliver(tp_dual_xy_event(300, 400, 2));
+                return true;
+            }
+        }
+        false
+    };
+    let (report, injected) = tokio::join!(
+        crate::write::diagnostics::probe_touchpad_on_channel(
+            &channel,
+            TP_DEVICE_INDEX,
+            Some(std::time::Duration::from_millis(400)),
+            None,
+        ),
+        inject,
+    );
+    assert!(injected, "the probe never enabled raw mode");
+    let report = report?;
+    assert_eq!(report.frames_received, 3);
+    assert_eq!(report.frames.len(), 2);
+    assert_eq!(report.state_before.bits(), 0);
+    assert_eq!(report.state_after_set, Some(RawReportFlags::RAW));
+    assert_eq!(report.frames[0].timestamp, 0x1234);
+    assert_eq!(report.frames[0].finger_count, 1);
+    assert!(report.frames[0].end_of_frame);
+    assert_eq!(report.frames[0].touch1.x, 100);
+    assert_eq!(report.frames[0].touch1.y, 200);
+    assert_eq!(report.frames[1].finger_count, 2);
+    // The volatile mode is handed back after the window.
+    assert_eq!(state.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        report.state_restored,
+        Some(RawReportFlags::empty()),
+        "the probe read back the restored mode"
+    );
+
+    let written = handle.written_reports();
+    let writes: Vec<u8> = written
+        .iter()
+        .filter(|report| is_raw_mode_write(report))
+        .map(|report| report[4])
+        .collect();
+    assert_eq!(writes, vec![0x01, 0x00], "on for the window, then off");
+    Ok(())
+}
+
+#[tokio::test]
+async fn touchpad_probe_on_an_already_raw_device_only_listens() -> Result<(), WriteError> {
+    let state = Arc::new(AtomicU8::new(0x01));
+    let (raw, handle) = ScriptedRawHidChannel::with_responder_shared(touchpad_responder(state));
+    let channel = scripted_channel(raw).await;
+
+    let report = crate::write::diagnostics::probe_touchpad_on_channel(
+        &channel,
+        TP_DEVICE_INDEX,
+        Some(std::time::Duration::from_millis(30)),
+        None,
+    )
+    .await?;
+
+    assert_eq!(report.state_before.bits(), 0x01);
+    assert!(
+        report.state_after_set.is_none(),
+        "an already-raw device is not re-written"
+    );
+    assert!(
+        !handle
+            .written_reports()
+            .iter()
+            .any(|r| is_raw_mode_write(r)),
+        "no mode write, so nothing to restore"
+    );
+    assert!(report.state_restored.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn touchpad_probe_shutdown_mid_window_still_restores() -> Result<(), WriteError> {
+    let state = Arc::new(AtomicU8::new(0));
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder_shared(touchpad_responder(Arc::clone(&state)));
+    let channel = scripted_channel(raw).await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    // A window long enough that only the shutdown can end it promptly; the
+    // probe must return restored well before it elapses.
+    let started = std::time::Instant::now();
+    let (report, ()) = tokio::join!(
+        crate::write::diagnostics::probe_touchpad_on_channel(
+            &channel,
+            TP_DEVICE_INDEX,
+            Some(std::time::Duration::from_secs(30)),
+            Some(shutdown_rx),
+        ),
+        async move {
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if handle
+                    .written_reports()
+                    .iter()
+                    .any(|r| is_raw_mode_write(r))
+                {
+                    shutdown_tx.send(()).expect("shutdown receiver alive");
+                    return;
+                }
+            }
+        },
+    );
+
+    let report = report?;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the shutdown ended the window early"
+    );
+    assert_eq!(report.state_before.bits(), 0);
+    assert!(report.state_after_set.is_some());
+    assert_eq!(report.state_restored, Some(RawReportFlags::empty()));
+    assert_eq!(state.load(Ordering::SeqCst), 0);
+    Ok(())
+}

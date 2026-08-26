@@ -18,6 +18,9 @@ use crate::backend::{BackendError, HidBackend, HotplugStream, NodeId, NodeInfo, 
 #[derive(Clone)]
 pub(crate) struct ScriptedRawHidHandle {
     written: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Pushes unsolicited inbound reports (feature events) into the channel's
+    /// read loop, the shape a device broadcasting mid-conversation takes.
+    incoming: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl ScriptedRawHidHandle {
@@ -27,10 +30,21 @@ impl ScriptedRawHidHandle {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// Inject an unsolicited inbound report, as a device broadcasting a
+    /// feature event would. Queued behind any response the responder queued
+    /// for the in-flight write, so ordering stays FIFO.
+    pub(crate) fn deliver(&self, report: Vec<u8>) {
+        let _ = self.incoming.send(report);
+    }
 }
 
 /// Answers a HID++ request as a particular scripted device would.
 pub(crate) type Responder = fn(&[u8]) -> Option<Vec<u8>>;
+
+/// A [`Responder`] that carries its own captured state, so a scripted device
+/// can answer differently before and after a mode write.
+pub(crate) type SharedResponder = std::sync::Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 /// Decides whether a raw write fails at the transport rather than reaching the
 /// device — the shape a node that has gone away takes.
@@ -40,14 +54,14 @@ pub(crate) struct ScriptedRawHidChannel {
     incoming_tx: mpsc::UnboundedSender<Vec<u8>>,
     incoming_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     written: Arc<Mutex<Vec<Vec<u8>>>>,
-    responder: Responder,
+    responder: SharedResponder,
     fails: Option<WriteFailure>,
 }
 
 impl ScriptedRawHidChannel {
     /// A channel answering as `responder`'s device.
     pub(crate) fn with_responder(responder: Responder) -> (Self, ScriptedRawHidHandle) {
-        Self::build(responder, None)
+        Self::with_responder_shared(responder)
     }
 
     /// The same, except that a write `fails` selects errors at the transport
@@ -61,18 +75,32 @@ impl ScriptedRawHidChannel {
         Self::build(responder, Some(fails))
     }
 
-    fn build(responder: Responder, fails: Option<WriteFailure>) -> (Self, ScriptedRawHidHandle) {
+    /// A channel answering as `responder`'s device, where `responder` may
+    /// carry state — a device whose read-back reflects the last mode write.
+    pub(crate) fn with_responder_shared(
+        responder: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> (Self, ScriptedRawHidHandle) {
+        Self::build(responder, None)
+    }
+
+    fn build(
+        responder: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+        fails: Option<WriteFailure>,
+    ) -> (Self, ScriptedRawHidHandle) {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let written = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
-                incoming_tx,
+                incoming_tx: incoming_tx.clone(),
                 incoming_rx: tokio::sync::Mutex::new(incoming_rx),
                 written: Arc::clone(&written),
-                responder,
+                responder: Arc::new(responder),
                 fails,
             },
-            ScriptedRawHidHandle { written },
+            ScriptedRawHidHandle {
+                written,
+                incoming: incoming_tx,
+            },
         )
     }
 }

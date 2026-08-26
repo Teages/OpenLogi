@@ -1,18 +1,24 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use hidpp::{
     channel::HidppChannel,
     device::Device,
     feature::CreatableFeature,
+    feature::EmittingFeature,
     feature::FeatureType,
     feature::battery_status::BatteryStatusFeature,
     feature::device_information::{
         DeviceEntityFirmwareInfo, DeviceEntityType, DeviceInformationFeature,
     },
     feature::feature_set::FeatureSetFeature,
+    feature::touchpad_raw_xy::{
+        DualXyData, RawReportFlags, TouchpadInfo, TouchpadRawEvent, TouchpadRawXyFeature,
+    },
     feature::unified_battery::UnifiedBatteryFeature,
     protocol::v20::Hidpp20Error,
 };
+use tokio::sync::oneshot;
 
 use crate::backend::HidBackend;
 use crate::channel::route::DeviceRoute;
@@ -194,6 +200,215 @@ pub async fn read_battery_raw(
         })
     })
     .await
+}
+
+/// Everything a touchpad told the `0x6100 TouchpadRawXy` probe: pad
+/// characteristics, the raw-report mode around the probe's own write, and the
+/// raw touch frames captured while the mode was on.
+///
+/// The hidpp feature types are re-exported verbatim (`TouchpadInfo`,
+/// `RawReportFlags`, [`DualXyData`]) rather than copied: a probe exists to
+/// surface wire values, and a second struct family would invite a field being
+/// dropped from one copy but not the other.
+#[derive(Debug, Clone)]
+pub struct TouchpadProbeReport {
+    /// Version of `0x6100` the device advertises.
+    pub feature_version: u8,
+    /// Pad characteristics from GetTouchpadInfo.
+    pub info: TouchpadInfo,
+    /// Raw-report mode before the probe touched anything.
+    pub state_before: RawReportFlags,
+    /// What the device reported immediately after the probe's
+    /// `set_raw_report_state(RAW)` — `None` when the probe never wrote (the
+    /// device was already in raw mode, or no sampling window was requested).
+    ///
+    /// The device is free to mask unsupported bits, so the difference between
+    /// the requested and confirmed modes is itself a probe finding.
+    pub state_after_set: Option<RawReportFlags>,
+    /// Touch states captured while raw mode was on, oldest first. A frame with
+    /// more than two fingers arrives as several events sharing a timestamp;
+    /// the last one carries `end_of_frame`.
+    ///
+    /// The sensor resends an unchanged contact state at its report rate
+    /// (~130 Hz measured on Casa Touch) while fingers rest, so `frames`
+    /// records each distinct touch/button state once instead of every
+    /// repetition — [`Self::frames_received`] counts what actually arrived.
+    pub frames: Vec<DualXyData>,
+    /// Total `DualXy` events received during the window, repetitions included.
+    pub frames_received: usize,
+    /// What the device reported after the probe restored the pre-probe mode —
+    /// `None` when there was nothing to restore.
+    pub state_restored: Option<RawReportFlags>,
+}
+
+/// Upper bound on *recorded* frames a single probe window collects, so a
+/// gesture rehearsal cannot balloon the report without bound.
+const MAX_PROBE_FRAMES: usize = 20_000;
+
+/// Whether one raw frame repeats the previous contact state verbatim (up to
+/// the timestamp), i.e. the sensor resending a resting hand.
+fn repeats_last_contact(frames: &[DualXyData], frame: &DualXyData) -> bool {
+    frames.last().is_some_and(|last| {
+        last.touch1 == frame.touch1
+            && last.touch2 == frame.touch2
+            && last.button == frame.button
+            && last.finger_count == frame.finger_count
+            && last.end_of_frame == frame.end_of_frame
+    })
+}
+
+/// Probe the HID++ `0x6100 TouchpadRawXy` feature of the device on `route`:
+/// read the pad characteristics and raw-report mode, and when `sample` is
+/// `Some`, enable raw reporting for that window and collect the touch frames
+/// the device emits.
+///
+/// The pre-probe raw-report mode is always restored afterwards; a device that
+/// was already reporting raw (`Options+` mid-gesture, a stale session) is only
+/// listened to, never re-written. Read results surface even when sampling is
+/// declined by the caller: the pad characteristics alone answer "does this
+/// touchpad speak 0x6100 and how many fingers does it track".
+///
+/// Once raw mode has been enabled, every exit path runs the restore first —
+/// errors before it are remembered, not returned early, so an interrupted
+/// probe can never leave the device reporting raw to nobody. The hardware
+/// caveat this cannot address: on a Bolt receiver the transport node is
+/// shared, and another open holder of it (Options+, a running agent) splits
+/// off input reports — a production gesture pipeline needs exclusive claim
+/// over the node, which is exactly why production uses a capture session.
+pub async fn probe_touchpad(
+    backend: &dyn HidBackend,
+    route: &DeviceRoute,
+    sample: Option<Duration>,
+    shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<TouchpadProbeReport, WriteError> {
+    let index = route.device_index();
+    with_route(backend, route, move |channel| async move {
+        probe_touchpad_on_channel(&channel, index, sample, shutdown).await
+    })
+    .await
+}
+
+/// [`probe_touchpad`] against an already-open channel, the shape the tests
+/// drive a scripted device through.
+pub(crate) async fn probe_touchpad_on_channel(
+    channel: &Arc<HidppChannel>,
+    index: u8,
+    sample: Option<Duration>,
+    mut shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<TouchpadProbeReport, WriteError> {
+    let mut device = Device::new(Arc::clone(channel), index)
+        .await
+        .map_err(|_| WriteError::DeviceUnreachable { index })?;
+    let feature_info = device
+        .root()
+        .get_feature(TouchpadRawXyFeature::ID)
+        .await
+        .map_err(|e| {
+            classify_hidpp_error(e, HidppOperation::ResolveFeature, TouchpadRawXyFeature::ID)
+        })?
+        .ok_or(WriteError::FeatureUnsupported {
+            feature_hex: TouchpadRawXyFeature::ID,
+        })?;
+    let feature = device.add_feature::<TouchpadRawXyFeature>(feature_info.index);
+
+    let info = feature
+        .get_touchpad_info()
+        .await
+        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+    let state_before = feature
+        .get_raw_report_state()
+        .await
+        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+
+    let mut report = TouchpadProbeReport {
+        feature_version: feature_info.version,
+        info,
+        state_before,
+        state_after_set: None,
+        frames: Vec::new(),
+        frames_received: 0,
+        state_restored: None,
+    };
+    let Some(sample) = sample else {
+        return Ok(report);
+    };
+
+    // Remembered rather than returned immediately: from the moment raw mode is
+    // enabled below, the restore at the end outranks every mid-probe error.
+    let mut failure: Option<WriteError> = None;
+
+    // A device already reporting raw is owned by whoever turned it on
+    // (Options+ mid-gesture, a stale session); listen only, restore nothing.
+    let wrote_mode = !report.state_before.contains(RawReportFlags::RAW);
+    if wrote_mode {
+        if let Err(e) = feature.set_raw_report_state(RawReportFlags::RAW).await {
+            return Err(WriteError::Hidpp(format!("{e:?}")));
+        }
+        match feature.get_raw_report_state().await {
+            Ok(confirmed) => report.state_after_set = Some(confirmed),
+            Err(e) => failure = Some(WriteError::Hidpp(format!("{e:?}"))),
+        }
+    }
+
+    // The EventSource listener is registered in the feature constructor, so
+    // frames emitted before this receiver exists would be lost — but raw mode
+    // was only just enabled, so there is no earlier frame to lose.
+    let receiver = feature.listen();
+    let deadline = tokio::time::Instant::now() + sample;
+    loop {
+        if tokio::time::Instant::now() >= deadline || report.frames.len() >= MAX_PROBE_FRAMES {
+            break;
+        }
+        // An external shutdown resolves here; with `None` this arm never
+        // wakes and the window (or the frame cap) ends the loop instead.
+        let shutdown_wait = async {
+            match shutdown.as_mut() {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(shutdown_wait);
+        tokio::select! {
+            () = &mut shutdown_wait => break,
+            // Window over.
+            () = tokio::time::sleep_until(deadline) => break,
+            event = receiver.recv() => match event {
+                Ok(TouchpadRawEvent::DualXy(frame)) => {
+                    report.frames_received += 1;
+                    if !repeats_last_contact(&report.frames, &frame) {
+                        report.frames.push(frame);
+                    }
+                }
+                Ok(_) => {}
+                // Event source dropped: the channel is going away.
+                Err(_) => break,
+            },
+        }
+    }
+
+    if wrote_mode {
+        if let Err(e) = feature.set_raw_report_state(state_before).await {
+            return Err(WriteError::Hidpp(format!(
+                "raw-report restore failed ({failure:?}): {e:?}"
+            )));
+        }
+        match feature.get_raw_report_state().await {
+            Ok(restored) => report.state_restored = Some(restored),
+            // A read-back miss after a successful restore write is odd but
+            // does not outweigh everything the probe already learned.
+            Err(e) => {
+                if failure.is_none() {
+                    failure = Some(WriteError::Hidpp(format!("{e:?}")));
+                }
+            }
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(report),
+    }
 }
 
 /// Firmware fields for one entity whose record the device answered and this

@@ -28,8 +28,8 @@ mod smartshift;
 
 pub use backlight::{get_backlight, set_backlight_enabled};
 pub use diagnostics::{
-    FeatureEntry, FirmwareEntity, FirmwareEntityInfo, ReprogControlEntry, dump_features,
-    dump_firmware_entities, dump_reprog_controls, read_battery_raw,
+    FeatureEntry, FirmwareEntity, FirmwareEntityInfo, ReprogControlEntry, TouchpadProbeReport,
+    dump_features, dump_firmware_entities, dump_reprog_controls, probe_touchpad, read_battery_raw,
 };
 pub use dpi::{
     Dpi, DpiCapabilities, DpiInfo, get_dpi, get_dpi_info, get_dpi_info_on, set_dpi, set_dpi_on,
@@ -41,6 +41,7 @@ pub use haptic::{
     clear_haptic_feature_cache, ensure_haptics_armed_on, play_haptic, play_haptic_on,
 };
 pub use hidpp::feature::haptic_feedback::HapticWaveform;
+pub use hidpp::feature::touchpad_raw_xy::{DualXyData, RawReportFlags, TouchPoint, TouchpadInfo};
 pub use hires_wheel::{
     ScrollReportingTarget, ScrollResolution, ScrollWheelMode, get_scroll_wheel_mode,
     get_scroll_wheel_mode_on, set_scroll_inversion, set_scroll_inversion_on, set_scroll_resolution,

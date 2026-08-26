@@ -16,6 +16,7 @@ pub mod dpi;
 pub mod features;
 pub mod lighting;
 pub mod smartshift;
+pub mod touchpad;
 pub mod wheel;
 
 #[derive(Debug, Subcommand)]
@@ -34,6 +35,8 @@ pub enum DiagCmd {
     Lighting(lighting::LightingArgs),
     /// Read or set the HID++ 0x2121 wheel reporting resolution.
     Wheel(wheel::WheelArgs),
+    /// Probe the HID++ 0x6100 touchpad feature; sample raw frames with --seconds.
+    Touchpad(touchpad::TouchpadArgs),
 }
 
 impl DiagCmd {
@@ -46,6 +49,7 @@ impl DiagCmd {
             Self::Smartshift(args) => smartshift::run(args).await,
             Self::Lighting(args) => lighting::run(args).await,
             Self::Wheel(args) => wheel::run(args).await,
+            Self::Touchpad(args) => touchpad::run(args).await,
         }
     }
 }
