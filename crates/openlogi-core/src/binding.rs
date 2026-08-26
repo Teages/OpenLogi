@@ -32,7 +32,9 @@ pub use action_ring::{
 pub use application_target::{ApplicationTarget, ApplicationTargetError};
 pub use button::ButtonId;
 pub use category::Category;
-pub use defaults::{default_binding, default_binding_for, default_gesture_binding};
+pub use defaults::{
+    default_binding, default_binding_for, default_gesture_binding, default_touchpad_gesture,
+};
 pub use effect::{Effect, MediaKey, MouseButton, NativeAction, Script, Shortcut};
 pub use gesture::GestureDirection;
 pub use key_combo::{KeyCombo, KeyComboParseError, KeyboardUsage, KeyboardUsageError};

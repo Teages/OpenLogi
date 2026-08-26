@@ -1,8 +1,11 @@
 //! Default bindings for a fresh device / gesture map.
 
+use crate::touchpad::TouchpadGestureId;
+
 use super::action::Action;
 use super::button::ButtonId;
 use super::gesture::GestureDirection;
+use super::key_combo::KeyCombo;
 use super::value::Binding;
 
 /// Sensible defaults for a fresh device so the panel isn't empty on first run.
@@ -118,5 +121,68 @@ pub fn default_binding_for(button: ButtonId) -> Binding {
                 .collect(),
         ),
         other => Binding::Single(default_binding(other)),
+    }
+}
+
+/// Default bindings for the touchpad gesture map. The three- and four-finger
+/// slots mirror what Logitech Options+ ships for a Casa Touch on macOS (its
+/// `defaults_gesture_osx.json`: 3-finger swipe up = Mission Control, down =
+/// App Exposé, sideways = switch desktops, 4-finger pinch = show desktop /
+/// Launchpad, pinch = zoom).
+///
+/// The taps deliberately stay [`Action::None`]: the pad's firmware already
+/// owns the touch baseline — a two-finger tap right-clicks in firmware, and
+/// classifying one on top would double-fire. Binding a tap explicitly in the
+/// config still dispatches; only the default is inert. Four-finger swipes
+/// have no Options+ default and follow the same rule.
+#[must_use]
+pub fn default_touchpad_gesture(gesture: TouchpadGestureId) -> Action {
+    match gesture {
+        TouchpadGestureId::TwoFingerTap => Action::None,
+        TouchpadGestureId::ThreeFingerTap => Action::None,
+        TouchpadGestureId::FourFingerTap => Action::None,
+        TouchpadGestureId::ThreeFingerSwipeUp => Action::MissionControl,
+        TouchpadGestureId::ThreeFingerSwipeDown => Action::AppExpose,
+        TouchpadGestureId::ThreeFingerSwipeLeft => Action::PreviousDesktop,
+        TouchpadGestureId::ThreeFingerSwipeRight => Action::NextDesktop,
+        TouchpadGestureId::FourFingerSwipeUp
+        | TouchpadGestureId::FourFingerSwipeDown
+        | TouchpadGestureId::FourFingerSwipeLeft
+        | TouchpadGestureId::FourFingerSwipeRight => Action::None,
+        TouchpadGestureId::TwoFingerPinchOut => zoom_chord("Cmd+="),
+        TouchpadGestureId::TwoFingerPinchIn => zoom_chord("Cmd+-"),
+        TouchpadGestureId::FourFingerPinchOut => Action::LaunchpadShow,
+        TouchpadGestureId::FourFingerPinchIn => Action::ShowDesktop,
+    }
+}
+
+/// The zoom chords behind the pinch defaults. Both spellings parse (locked by
+/// the `pinch_default_chords_parse` test); the fallback only exists because
+/// [`KeyCombo`]'s constructor is a parse, and stays dead while that test is
+/// green.
+fn zoom_chord(chord: &str) -> Action {
+    chord
+        .parse::<KeyCombo>()
+        .map_or(Action::None, Action::CustomShortcut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinch_default_chords_parse() {
+        // `zoom_chord`'s `Action::None` fallback exists only because the
+        // constructor is a parse; if these spellings ever stop parsing the
+        // pinch defaults would silently go inert, so lock them live here.
+        for gesture in [
+            TouchpadGestureId::TwoFingerPinchOut,
+            TouchpadGestureId::TwoFingerPinchIn,
+        ] {
+            assert!(
+                matches!(default_touchpad_gesture(gesture), Action::CustomShortcut(_)),
+                "{gesture}'s default must be a real chord"
+            );
+        }
     }
 }
