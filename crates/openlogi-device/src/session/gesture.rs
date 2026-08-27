@@ -327,6 +327,12 @@ async fn run_session_loop(
     );
     let mut shutdown = std::pin::pin!(shutdown);
     let mut silent_pings = 0u8;
+    // When the touchpad's raw event stream last spoke — the silence
+    // watchdog's anchor. The pad reports on activity only: without a timer,
+    // a lift-off the firmware never announces would leave the stroke (and
+    // its commit latch) open forever, killing every gesture after the first.
+    let mut last_touch_at = tokio::time::Instant::now();
+    let touchpad_armed = touchpad.is_some();
     loop {
         tokio::select! {
             _ = &mut shutdown => return false,
@@ -360,12 +366,38 @@ async fn run_session_loop(
                     None => std::future::pending().await,
                 }
             } => {
+                last_touch_at = tokio::time::Instant::now();
                 if let Some(gesture) = touchpad
                     .as_mut()
                     .zip(event)
                     .and_then(|(capture, event)| capture.feed(event))
                 {
                     debug!(index = device_index, %gesture, "touchpad gesture committed");
+                    let _ = sink.send(CapturedInput::TouchpadGesture(gesture));
+                }
+            }
+            // Silence watchdog, the counterpart of Options+'s
+            // `requestEmptyReportCallback`: a pad that went quiet mid-stroke
+            // gets its stroke ended synthetically. Re-arms every window while
+            // armed; a no-op when nothing is open. The inline async block is
+            // rebuilt each iteration, so the moving deadline is safe to poll.
+            () = async {
+                let wait_silence = async {
+                    tokio::time::sleep_until(last_touch_at + crate::touchpad::TOUCH_SILENCE).await;
+                };
+                let wait_never = std::future::pending::<()>();
+                if touchpad_armed {
+                    wait_silence.await;
+                } else {
+                    wait_never.await;
+                }
+            } => {
+                last_touch_at = tokio::time::Instant::now();
+                if let Some(gesture) = touchpad
+                    .as_mut()
+                    .and_then(TouchpadCapture::end_stroke_on_silence)
+                {
+                    debug!(index = device_index, %gesture, "touchpad gesture committed after silence");
                     let _ = sink.send(CapturedInput::TouchpadGesture(gesture));
                 }
             }

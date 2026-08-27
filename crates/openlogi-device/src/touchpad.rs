@@ -122,6 +122,19 @@ fn tap_max_ticks(timestamp_units: u8) -> u16 {
     u16::try_from(TAP_MAX_MS.saturating_mul(10) / units).unwrap_or(u16::MAX)
 }
 
+/// How long the session waits for further `0x6100` events before deciding
+/// the pad went silent and ending any open stroke by itself. Thirteen frames
+/// at the pad's ~130 Hz report rate — a live stroke never gaps that long,
+/// and the latency only delays the *end* of a gesture.
+pub(crate) const TOUCH_SILENCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`TOUCH_SILENCE`] in the pad's own frame ticks, for the synthetic
+/// lift-off timestamp (same unit math as [`tap_max_ticks`]).
+fn silence_ticks(timestamp_units: u8) -> u16 {
+    let units = u32::from(timestamp_units.max(1));
+    u16::try_from(100_u32.saturating_mul(10) / units).unwrap_or(u16::MAX)
+}
+
 /// Arming state for a touchpad's raw-report mode: what to hand back to the
 /// firmware on disarm.
 pub(crate) struct TouchpadArmed {
@@ -144,6 +157,11 @@ pub(crate) struct TouchpadArmed {
 pub struct TouchpadCaptureState {
     assembler: LogicalFrameAssembler,
     classifier: TouchpadClassifier,
+    /// Timestamp of the last event seen, for the synthetic lift-off.
+    last_ts: u16,
+    /// [`TOUCH_SILENCE`] in frame ticks, advanced onto [`Self::last_ts`] when
+    /// the pad goes silent mid-stroke.
+    silence_ticks: u16,
 }
 
 impl TouchpadCaptureState {
@@ -154,11 +172,14 @@ impl TouchpadCaptureState {
         Self {
             assembler: LogicalFrameAssembler::default(),
             classifier: TouchpadClassifier::new(x_size, y_size, tap_max_ticks(timestamp_units)),
+            last_ts: 0,
+            silence_ticks: silence_ticks(timestamp_units),
         }
     }
 
     /// Feed one raw event; returns the gesture it committed, if any.
     pub fn feed(&mut self, event: DualXyData) -> Option<TouchpadGestureId> {
+        self.last_ts = event.timestamp;
         let frame = self.assembler.push(event)?;
         self.classifier.push(&frame)
     }
@@ -169,6 +190,29 @@ impl TouchpadCaptureState {
     pub fn flush(&mut self) -> Option<TouchpadGestureId> {
         let frame = self.assembler.flush()?;
         self.classifier.push(&frame)
+    }
+
+    /// End any open stroke synthetically: the pad went silent without
+    /// reporting an all-fingers-up frame.
+    ///
+    /// These pads do not guarantee an empty report after lift-off — the
+    /// stream simply stops (a resting *hand* re-sends; no hand sends
+    /// nothing). Logitech's own engine solves this with a timer
+    /// (`requestEmptyReportCallback` → `processEmptyReport`); the session's
+    /// silence watchdog calls this on timeout. Without it, the first
+    /// committed gesture latches forever and every later stroke is dead air.
+    ///
+    /// Delivers any still-pending frame group first (the final touched frame
+    /// may itself cross a commit gate), then feeds the classifier an
+    /// all-lifted frame timestamped one silence-window after the last event.
+    pub(crate) fn end_stroke_on_silence(&mut self) -> Option<TouchpadGestureId> {
+        let flushed = self.flush();
+        let lift_ts = self.last_ts.wrapping_add(self.silence_ticks);
+        let ended = self.classifier.push(&TouchFrame {
+            timestamp: lift_ts,
+            contacts: Vec::new(),
+        });
+        flushed.or(ended)
     }
 }
 
@@ -216,6 +260,12 @@ impl TouchpadCapture {
             // assembler can't consume yet is inert, not an error.
             _ => None,
         }
+    }
+
+    /// End any open stroke synthetically — see
+    /// [`TouchpadCaptureState::end_stroke_on_silence`].
+    pub(crate) fn end_stroke_on_silence(&mut self) -> Option<TouchpadGestureId> {
+        self.state.end_stroke_on_silence()
     }
 }
 
@@ -385,6 +435,85 @@ mod tests {
                 Some(TouchpadGestureId::ThreeFingerSwipeRight)
             ],
             "the swipe commits on the fifth consistent frame, surfacing one feed later"
+        );
+    }
+
+    #[test]
+    fn a_silent_pad_ends_the_stroke_so_the_next_gesture_fires() {
+        // The pad reports on activity only: after lift-off the stream just
+        // stops — no all-fingers-up frame ever arrives. Without the
+        // synthetic end, the first gesture's commit latch stays set forever
+        // and the second swipe is dead air (exactly the hardware symptom
+        // this mirrors: one gesture works, then nothing).
+        let mut state = TouchpadCaptureState::new(2775, 1786, 1);
+        let feed_frame = |state: &mut TouchpadCaptureState, ts: u16, x: u16| {
+            let opening = state.feed(part(ts, touch(0, x, 800), touch(1, x + 20, 860), 3, false));
+            opening.or_else(|| {
+                state.feed(part(
+                    ts,
+                    touch(2, x + 40, 920),
+                    hover(touch(0, 0, 0)),
+                    3,
+                    true,
+                ))
+            })
+        };
+        // First swipe: five frames, commits on the closing part of frame 5
+        // surfacing through frame 6's opening part.
+        let _ = feed_frame(&mut state, 100, 600);
+        for k in 1..=6_u16 {
+            let _ = feed_frame(&mut state, 100 + 125 * k, 600 + 40 * k);
+        }
+        // Silence. The synthetic end delivers the pending final frame and
+        // ends the stroke; nothing more may fire from it here.
+        assert_eq!(state.end_stroke_on_silence(), None);
+        // Second swipe, fresh ids at a fresh spot: must commit again.
+        let _ = feed_frame(&mut state, 5000, 700);
+        let mut second = None;
+        for k in 1..=6_u16 {
+            if let Some(g) = feed_frame(&mut state, 5000 + 125 * k, 700 + 40 * k) {
+                second = Some(g);
+            }
+        }
+        assert_eq!(
+            second,
+            Some(TouchpadGestureId::ThreeFingerSwipeRight),
+            "the silence-ended stroke must not poison the next one"
+        );
+    }
+
+    #[test]
+    fn a_late_swipe_frame_surfaces_through_the_silence_end() {
+        // The final touched frame still sits uncommitted in the assembler
+        // when the pad goes silent; the synthetic end hands it over first,
+        // so a sweep whose fifth frame was the last event commits at the
+        // silence boundary rather than never.
+        let mut state = TouchpadCaptureState::new(2775, 1786, 1);
+        let feed_frame = |state: &mut TouchpadCaptureState, k: u16| {
+            let ts = 100 + 125 * k;
+            let x = 600 + 40 * k;
+            let opening = state.feed(part(ts, touch(0, x, 800), touch(1, x + 20, 860), 3, false));
+            opening.or_else(|| {
+                state.feed(part(
+                    ts,
+                    touch(2, x + 40, 920),
+                    hover(touch(0, 0, 0)),
+                    3,
+                    true,
+                ))
+            })
+        };
+        // Landing (k=0) plus exactly five sweep frames; the fifth frame's
+        // group is complete but still pending (lazy commit) when the pad
+        // goes silent.
+        let _ = feed_frame(&mut state, 0);
+        for k in 1..=5_u16 {
+            assert_eq!(feed_frame(&mut state, k), None);
+        }
+        // Silence hands the fifth frame to the classifier, which commits.
+        assert_eq!(
+            state.end_stroke_on_silence(),
+            Some(TouchpadGestureId::ThreeFingerSwipeRight)
         );
     }
 
