@@ -52,6 +52,12 @@ const CROSS_SPAN_DENOM: i32 = 5;
 /// Per-frame mean motion below which nothing is learned — neither a run
 /// starts nor resets. Absorbs sensor jitter in an otherwise still hand.
 const FRAME_DEADZONE: f64 = 3.0;
+/// A fast, short snap — a flick — may commit after only three frames,
+/// skipping the time gate: `FLICK_FRAMES` frames carrying 8× the travel
+/// floor is ~72 units/frame on this pad (≈ 40 cm/s), a genuine snap that
+/// deliberate slow motion cannot fake while staying co-directed.
+const FLICK_FRAMES: u32 = 3;
+const FLICK_TRAVEL_MULT: f64 = 8.0;
 /// How much further the average finger may move than the group's mean
 /// motion before the frame reads as converge/spread rather than a
 /// co-directed sweep (our stand-in for the engine's recognizer
@@ -422,10 +428,14 @@ impl TouchpadClassifier {
             self.swipe.acc.1.abs()
         };
         let held = ts.wrapping_sub(self.swipe.start_ts);
-        if self.swipe.frames >= SWIPE_MIN_FRAMES
+        // The ordinary gate is frames + time + floor; a flick substitutes
+        // speed for time — the same travel in a third of the frames.
+        let steady = self.swipe.frames >= SWIPE_MIN_FRAMES
             && held >= self.swipe_min_ticks
-            && travel >= f64::from(self.swipe_travel_floor)
-        {
+            && travel >= f64::from(self.swipe_travel_floor);
+        let flick = self.swipe.frames >= FLICK_FRAMES
+            && travel >= f64::from(self.swipe_travel_floor) * FLICK_TRAVEL_MULT;
+        if steady || flick {
             let fingers = match self.stroke_fingers {
                 3 | 4 => u8::try_from(self.stroke_fingers).unwrap_or(3),
                 _ => return None,

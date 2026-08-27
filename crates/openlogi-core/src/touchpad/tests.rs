@@ -207,11 +207,12 @@ fn vertical_swipe_direction_follows_the_dominant_axis() {
     };
     let mut classifier = classifier();
     classifier.push(&up(1500, 100));
-    for k in 1..=4_u16 {
+    for k in 1..=3_u16 {
         assert_eq!(classifier.push(&up(1500 - 60 * k, 100 + 125 * k)), None);
     }
-    assert_eq!(classifier.push(&up(1200, 725)), Some(G::ThreeFingerSwipeUp));
-    assert_eq!(classifier.push(&up(1140, 850)), None);
+    // 240 units by the fourth frame clears the flick threshold (216).
+    assert_eq!(classifier.push(&up(1260, 600)), Some(G::ThreeFingerSwipeUp));
+    assert_eq!(classifier.push(&up(1200, 725)), None);
 }
 
 #[test]
@@ -440,6 +441,37 @@ fn an_asymmetric_pinch_never_locks_a_swipe() {
         Some(G::FourFingerPinchOut),
         "the spreading group must commit as a pinch, never a swipe"
     );
+}
+
+#[test]
+fn a_quick_flick_commits_after_three_frames() {
+    // A fast snap — 130 units per frame — covers the flick threshold (8×
+    // the 27-unit floor = 216 units) in three frames and ~25 ms, well under
+    // the 50 ms time gate. Without the flick rule the fingers would lift
+    // before the steady gate ever passed and the snap would be lost.
+    let mut classifier = classifier();
+    classifier.push(&hand(600, 700, 100));
+    assert_eq!(classifier.push(&hand(730, 700, 125)), None);
+    assert_eq!(classifier.push(&hand(860, 700, 150)), None);
+    assert_eq!(
+        classifier.push(&hand(990, 700, 175)),
+        Some(G::ThreeFingerSwipeRight)
+    );
+}
+
+#[test]
+fn slow_short_motion_is_not_a_flick() {
+    // 20 units per frame for three frames: above the deadzone, co-directed,
+    // but only 60 units of travel — under both the floor and the flick
+    // threshold. Nothing may fire until the steady gate passes.
+    let mut classifier = classifier();
+    classifier.push(&hand(600, 700, 100));
+    for k in 1..=3_u16 {
+        assert_eq!(
+            classifier.push(&hand(600 + 20 * k, 700, 100 + 25 * k)),
+            None
+        );
+    }
 }
 
 #[test]
