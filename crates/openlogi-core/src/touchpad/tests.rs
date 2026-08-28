@@ -82,6 +82,76 @@ fn three_finger_swipes_commit_at_most_once_per_stroke() {
 }
 
 #[test]
+fn sequential_finger_landings_can_become_a_three_finger_swipe() {
+    let mut recognizer = TouchpadGestureRecognizer::default();
+
+    assert_eq!(
+        recognizer.update(&translated_frame(0, 1, 0, 0)),
+        GestureRecognition::Pending
+    );
+    assert_eq!(
+        recognizer.update(&translated_frame(8_000, 2, 0, 0)),
+        GestureRecognition::Pending
+    );
+    assert_eq!(
+        recognizer.update(&translated_frame(16_000, 3, 0, 0)),
+        GestureRecognition::Pending
+    );
+    assert_eq!(
+        recognizer.update(&translated_frame(76_000, 3, 15_000, 0)),
+        GestureRecognition::Gesture(ButtonId::TouchpadThreeFingerSwipeRight)
+    );
+}
+
+#[test]
+fn three_finger_swipe_can_finish_after_one_finger_lifts() {
+    let mut recognizer = TouchpadGestureRecognizer::default();
+    recognizer.update(&translated_frame(0, 3, 0, 0));
+    recognizer.update(&translated_frame(20_000, 3, 5_000, 0));
+
+    assert_eq!(
+        recognizer.update(&frame(
+            30_000,
+            vec![contact(1, 57_500, 50_000), contact(2, 67_500, 50_000)],
+        )),
+        GestureRecognition::Pending
+    );
+    assert_eq!(
+        recognizer.update(&frame(
+            60_000,
+            vec![contact(1, 65_000, 50_000), contact(2, 75_000, 50_000)],
+        )),
+        GestureRecognition::Gesture(ButtonId::TouchpadThreeFingerSwipeRight)
+    );
+}
+
+#[test]
+fn a_fast_three_frame_flick_bypasses_the_duration_gate() {
+    let mut recognizer = TouchpadGestureRecognizer::default();
+    recognizer.update(&translated_frame(0, 3, 0, 0));
+    recognizer.update(&translated_frame(8_000, 3, 5_000, 0));
+    recognizer.update(&translated_frame(16_000, 3, 10_000, 0));
+
+    assert_eq!(
+        recognizer.update(&translated_frame(24_000, 3, 15_000, 0)),
+        GestureRecognition::Gesture(ButtonId::TouchpadThreeFingerSwipeRight)
+    );
+}
+
+#[test]
+fn a_fast_flick_still_requires_three_motion_frames() {
+    let mut recognizer = TouchpadGestureRecognizer::default();
+    recognizer.update(&translated_frame(0, 3, 0, 0));
+    recognizer.update(&translated_frame(8_000, 3, 7_500, 0));
+
+    assert_eq!(
+        recognizer.update(&translated_frame(16_000, 3, 15_000, 0)),
+        GestureRecognition::Pending
+    );
+    assert_eq!(recognizer.end(), None);
+}
+
+#[test]
 fn cardinal_swipes_keep_the_locked_finger_count_and_direction() {
     let recognize = |count, dx, dy| {
         let mut recognizer = TouchpadGestureRecognizer::default();
