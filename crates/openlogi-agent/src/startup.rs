@@ -18,7 +18,10 @@ use openlogi_agent_core::orchestrator::{Orchestrator, SharedRuntime};
 use openlogi_agent_core::runtime::scroll::{ScrollInputHandle, ScrollRuntime};
 use openlogi_agent_core::runtime::{ActionDispatcher, ActionRuntime};
 use openlogi_agent_core::touchpad_monitor::TouchpadMonitor;
-use openlogi_agent_core::watchers::{self, gesture::GestureOutputs};
+use openlogi_agent_core::watchers::{
+    self,
+    gesture::{GestureOutputs, GestureWatcher},
+};
 use openlogi_core::config::Config;
 use openlogi_core::device::DeviceInventory;
 use openlogi_core::device_order::DeviceIdentity;
@@ -311,8 +314,8 @@ pub(crate) fn spawn_hidpp_watchers(
     shared: &SharedRuntime,
     inputs: &InputServices,
     touchpad_monitor: Arc<TouchpadMonitor>,
-) {
-    watchers::gesture::spawn(
+) -> GestureWatcher {
+    let gesture = watchers::gesture::spawn(
         &shared.capture_plans,
         shared.capture_channel.clone(),
         shared.receiver_access.clone(),
@@ -332,6 +335,7 @@ pub(crate) fn spawn_hidpp_watchers(
         shared.channel_registry.clone(),
         inputs.dispatcher.clone(),
     );
+    gesture
 }
 
 /// One tagged event from the per-source state watchers.

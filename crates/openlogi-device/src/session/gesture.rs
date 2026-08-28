@@ -664,11 +664,43 @@ struct CaptureMonitor<'a> {
     sink: &'a mpsc::UnboundedSender<CapturedInput>,
 }
 
+impl CaptureMonitor<'_> {
+    fn push_touchpad_event(&mut self, event: hidpp::feature::touchpad_raw_xy::TouchpadRawEvent) {
+        if let Some(touchpad) = self.armed.touchpad.as_mut() {
+            touchpad.push(event, self.sink);
+        }
+    }
+
+    fn flush_touchpad_end(&mut self) {
+        if let Some(touchpad) = self.armed.touchpad.as_mut() {
+            for event in touchpad.stream.poll_end(std::time::Instant::now()) {
+                send_touchpad_event(event, self.sink);
+            }
+        }
+    }
+}
+
+fn log_raw_mode_failure(device_index: u8, error: &GestureError) {
+    if matches!(error, GestureError::TouchpadRawModeConflict { .. }) {
+        warn!(
+            index = device_index,
+            error = %error,
+            "touchpad raw mode changed externally — stopping capture without rearming"
+        );
+    } else {
+        warn!(
+            index = device_index,
+            error = %error,
+            "touchpad raw-mode verification failed — restarting capture"
+        );
+    }
+}
+
 /// Keep a capture session alive and reapply its volatile diversions whenever
 /// the device announces a reconnect. Returns only the typed reason capture
 /// stopped; restoration performs a fresh registry lookup after monitoring.
 async fn monitor_capture(
-    context: CaptureMonitor<'_>,
+    mut context: CaptureMonitor<'_>,
     wireless: Option<WirelessDeviceStatusFeature>,
     shutdown: oneshot::Receiver<()>,
 ) -> (CaptureStop, Option<GestureError>) {
@@ -707,18 +739,13 @@ async fn monitor_capture(
                 }
             } => {
                 match event {
-                    Ok(event) => {
-                        if let Some(touchpad) = context.armed.touchpad.as_mut() {
-                            touchpad.push(event, context.sink);
-                        }
-                    }
+                    Ok(event) => context.push_touchpad_event(event),
                     Err(error) => {
-                        let error = GestureError::Hidpp(format!(
-                            "touchpad event stream closed: {error}"
-                        ));
                         return (
                             stop_for_current_publication(context.registry, context.shared),
-                            Some(error),
+                            Some(GestureError::Hidpp(format!(
+                                "touchpad event stream closed: {error}"
+                            ))),
                         );
                     }
                 }
@@ -730,29 +757,13 @@ async fn monitor_capture(
                     std::future::pending::<()>().await;
                 }
             } => {
-                if let Some(touchpad) = context.armed.touchpad.as_mut() {
-                    for event in touchpad.stream.poll_end(std::time::Instant::now()) {
-                        send_touchpad_event(event, context.sink);
-                    }
-                }
+                context.flush_touchpad_end();
             }
             _ = raw_mode_ticker.tick(), if context.armed.touchpad.is_some() => {
                 if let Some(touchpad) = context.armed.touchpad.as_ref()
                     && let Err(error) = touchpad.verify_raw_mode().await
                 {
-                    if matches!(error, GestureError::TouchpadRawModeConflict { .. }) {
-                        warn!(
-                            index = context.device_index,
-                            error = %error,
-                            "touchpad raw mode changed externally — stopping capture without rearming"
-                        );
-                    } else {
-                        warn!(
-                            index = context.device_index,
-                            error = %error,
-                            "touchpad raw-mode verification failed — restarting capture"
-                        );
-                    }
+                    log_raw_mode_failure(context.device_index, &error);
                     return (
                         stop_for_current_publication(context.registry, context.shared),
                         Some(error),

@@ -15,6 +15,7 @@ use openlogi_ipc::{
     TouchpadMonitorBatch, TouchpadMonitorContact, TouchpadMonitorEvent, TouchpadMonitorRecord,
     TouchpadRawModeConflict,
 };
+use tokio::sync::watch;
 
 /// Shared monitor used by the capture manager and Agent IPC server.
 pub type SharedTouchpadMonitor = Arc<TouchpadMonitor>;
@@ -33,34 +34,44 @@ struct MonitorState {
 }
 
 /// On-demand trace buffer for normalized `0x6100` capture events.
-#[derive(Default)]
 pub struct TouchpadMonitor {
-    enabled: AtomicBool,
     polled: AtomicBool,
     state: Mutex<MonitorState>,
+    capture_requests: watch::Sender<()>,
+}
+
+impl Default for TouchpadMonitor {
+    fn default() -> Self {
+        let (capture_requests, _) = watch::channel(());
+        Self {
+            polled: AtomicBool::new(false),
+            state: Mutex::new(MonitorState::default()),
+            capture_requests,
+        }
+    }
 }
 
 impl TouchpadMonitor {
+    /// Subscribe to changes in the device requested for diagnostic capture.
+    pub(crate) fn subscribe_capture_requests(&self) -> watch::Receiver<()> {
+        self.capture_requests.subscribe()
+    }
+
     /// Whether an active diagnostic requests raw-touchpad capture for this
     /// exact stable device in its existing session.
     #[must_use]
     pub fn capture_requested_for(&self, device_key: &str) -> bool {
-        self.enabled.load(Ordering::Acquire)
-            && self
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .requested_device
-                .as_deref()
-                == Some(device_key)
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .requested_device
+            .as_deref()
+            == Some(device_key)
     }
 
     /// Mirror one input from a current capture session when diagnostics are
     /// enabled. Non-touchpad inputs are ignored.
     pub fn record(&self, device_key: &str, input: &CapturedInput) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return;
-        }
         let event = match input {
             CapturedInput::TouchpadFrame(frame) => TouchpadMonitorEvent::Frame {
                 timestamp_us: frame.timestamp_us,
@@ -129,13 +140,13 @@ impl TouchpadMonitor {
     pub fn poll(&self, device_key: &str) -> TouchpadMonitorBatch {
         self.polled.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.requested_device.as_deref() != Some(device_key) {
+        let changed = state.requested_device.as_deref() != Some(device_key);
+        if changed {
             state.requested_device = Some(device_key.to_string());
             state.events.clear();
             state.dropped_events = 0;
         }
-        self.enabled.store(true, Ordering::Release);
-        TouchpadMonitorBatch {
+        let batch = TouchpadMonitorBatch {
             events: state
                 .events
                 .drain(..)
@@ -148,15 +159,23 @@ impl TouchpadMonitor {
                 .cloned()
                 .into_iter()
                 .collect(),
+        };
+        drop(state);
+        if changed {
+            self.capture_requests.send_replace(());
         }
+        batch
     }
 
     fn disable(&self) {
-        self.enabled.store(false, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.requested_device = None;
+        let changed = state.requested_device.take().is_some();
         state.events.clear();
         state.dropped_events = 0;
+        drop(state);
+        if changed {
+            self.capture_requests.send_replace(());
+        }
     }
 
     /// Disable event mirroring when diagnostic polls stop. Conflict state is
@@ -166,7 +185,7 @@ impl TouchpadMonitor {
             tokio::time::interval_at(tokio::time::Instant::now() + IDLE_TICK, IDLE_TICK);
         loop {
             ticker.tick().await;
-            if self.enabled.load(Ordering::Acquire) && !self.polled.swap(false, Ordering::Relaxed) {
+            if !self.polled.swap(false, Ordering::Relaxed) {
                 self.disable();
             }
         }
@@ -250,5 +269,35 @@ mod tests {
         );
         monitor.clear_conflict("unit:casa");
         assert!(monitor.poll("unit:casa").conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_request_changes_notify_the_capture_manager() {
+        let monitor = TouchpadMonitor::default();
+        let mut requests = monitor.subscribe_capture_requests();
+
+        monitor.poll("unit:casa");
+        requests
+            .changed()
+            .await
+            .expect("the capture request publisher should remain open");
+        monitor.poll("unit:casa");
+        assert!(
+            !requests
+                .has_changed()
+                .expect("the capture request publisher should remain open")
+        );
+
+        monitor.poll("unit:other");
+        requests
+            .changed()
+            .await
+            .expect("changing the requested device should publish");
+        monitor.disable();
+        requests
+            .changed()
+            .await
+            .expect("disabling diagnostics should publish");
+        assert!(!monitor.capture_requested_for("unit:other"));
     }
 }

@@ -166,6 +166,40 @@ async fn input_accepted_during_restoration_precedes_session_done() {
 }
 
 #[test]
+fn shutdown_requests_every_live_session_stop() {
+    let first_plan = plan();
+    let first_key = first_plan.target.physical_key.clone();
+    let (first_stop, mut first_stopped) = oneshot::channel();
+    let first = CaptureSession::active(
+        session_id(7),
+        first_plan.target,
+        first_plan.dispatch,
+        first_stop,
+    );
+    let mut second_plan = plan();
+    second_plan.target.physical_key =
+        PhysicalDeviceKey::parse("unit:00000002").expect("fixture should be a physical key");
+    let second_key = second_plan.target.physical_key.clone();
+    let (second_stop, mut second_stopped) = oneshot::channel();
+    let second = CaptureSession::active(
+        session_id(8),
+        second_plan.target,
+        second_plan.dispatch,
+        second_stop,
+    );
+    let mut sessions = HashMap::from([(first_key, first), (second_key, second)]);
+    let mut cancelled = Vec::new();
+
+    request_session_stops(&mut sessions, |session| cancelled.push(session.clone()));
+
+    cancelled.sort_by_key(HidppSessionId::epoch);
+    assert_eq!(cancelled, vec![session_id(7), session_id(8)]);
+    assert_eq!(first_stopped.try_recv(), Ok(()));
+    assert_eq!(second_stopped.try_recv(), Ok(()));
+    assert!(sessions.values().all(|session| !session.is_active()));
+}
+
+#[test]
 fn accepts_inputs_from_the_current_session_until_teardown_finishes() {
     assert!(dispatch_context_for(&session_id(7), Some(&live_session_with_epoch(7))).is_some());
     assert!(
@@ -204,9 +238,7 @@ async fn exclusive_request_retires_capture_without_rejecting_owned_input() {
     let plans = Arc::new(vec![plan()]);
     let requests = access.subscribe_requests();
     let monitor = Arc::new(crate::touchpad_monitor::TouchpadMonitor::default());
-    assert!(
-        wanted_sessions(*requests.borrow(), &plans, &monitor, None).is_empty()
-    );
+    assert!(wanted_sessions(*requests.borrow(), &plans, &monitor, None).is_empty());
 
     let mut session = live_session_with_epoch(7);
     assert_eq!(session.reconcile(None), ReconcileAction::Retiring);
@@ -557,9 +589,11 @@ fn diagnostics_temporarily_arm_only_raw_touchpad_plans() {
         "touchpad-a",
         route(),
         None,
-        Some("unit:01020304".into()),
-        0,
-        true,
+        crate::capture_plan::CapturePlanOptions {
+            touchpad_journal_id: Some("unit:01020304".into()),
+            rearm_generation: 0,
+            os_mouse_hook_available: true,
+        },
     );
     let mouse = crate::capture_plan::plan_for_device(
         &openlogi_core::config::Config::default(),
@@ -639,9 +673,11 @@ fn managed_touchpad_session_stays_wanted_without_a_journal_record() {
         "touchpad-a",
         route(),
         None,
-        Some("unit:01020304".to_string()),
-        0,
-        true,
+        crate::capture_plan::CapturePlanOptions {
+            touchpad_journal_id: Some("unit:01020304".to_string()),
+            rearm_generation: 0,
+            os_mouse_hook_available: true,
+        },
     );
     let plans = Arc::new(vec![plan]);
     let monitor = Arc::new(crate::touchpad_monitor::TouchpadMonitor::default());

@@ -104,6 +104,7 @@ fn main() {
             return;
         }
     };
+    let shutdown_requests = shutdown::request_channel();
 
     // macOS hosts the menu-bar item, which needs an NSApplication run loop on
     // the process main thread — so the async core (orchestrator, IPC, watchers,
@@ -130,6 +131,7 @@ fn main() {
                     config,
                     core_resume_pending,
                     uninstalled,
+                    shutdown_requests,
                     armed_tx,
                 ));
             })
@@ -153,10 +155,15 @@ fn main() {
             // when the flag is set.
             let resume_pending = Arc::new(AtomicBool::new(false));
             resume_windows::register(Arc::clone(&resume_pending));
-            runtime.block_on(lifecycle::run(config, resume_pending, uninstalled));
+            runtime.block_on(lifecycle::run(
+                config,
+                resume_pending,
+                uninstalled,
+                shutdown_requests,
+            ));
         }
         #[cfg(not(target_os = "windows"))]
-        runtime.block_on(lifecycle::run(config, uninstalled));
+        runtime.block_on(lifecycle::run(config, uninstalled, shutdown_requests));
     }
 }
 

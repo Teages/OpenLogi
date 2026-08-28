@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::action_ring::ActionRingSessionSpec;
 use crate::capture_plan::{
-    DeviceCapturePlan, SharedCapturePlans, hidpp_side_gesture_maps_for,
+    CapturePlanOptions, DeviceCapturePlan, SharedCapturePlans, hidpp_side_gesture_maps_for,
     plan_for_device_with_touchpad, touchpad_recovery_plan,
 };
 use crate::hardware::DeviceOp;
@@ -440,9 +440,11 @@ impl Orchestrator {
                         &dev.config_key,
                         route,
                         self.current_app.as_deref(),
-                        touchpad_journal_id,
-                        rearm_generation,
-                        self.os_mouse_hook_available,
+                        CapturePlanOptions {
+                            touchpad_journal_id,
+                            rearm_generation,
+                            os_mouse_hook_available: self.os_mouse_hook_available,
+                        },
                     ))
                 } else {
                     touchpad_journal_id.map(|journal_id| {

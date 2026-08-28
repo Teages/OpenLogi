@@ -30,6 +30,7 @@ use openlogi_agent_core::orchestrator::{Orchestrator, SharedRuntime};
 use openlogi_agent_core::runtime::hook;
 use openlogi_agent_core::touchpad_monitor::TouchpadMonitor;
 use openlogi_agent_core::watchers::foreground_app::ForegroundUpdate;
+use openlogi_agent_core::watchers::gesture::GestureWatcher;
 use openlogi_agent_core::watchers::inventory::InventoryEvent;
 use openlogi_core::config::Config;
 use openlogi_hook::Hook;
@@ -58,6 +59,7 @@ pub(crate) async fn run(
     config: Config,
     #[cfg(any(target_os = "macos", target_os = "windows"))] resume_pending: Arc<AtomicBool>,
     uninstalled: UnboundedReceiver<()>,
+    shutdown_requests: UnboundedReceiver<&'static str>,
     #[cfg(target_os = "macos")] armed_tx: std::sync::mpsc::Sender<()>,
 ) {
     // Reconcile the agent's launch-at-login autostart and clear the legacy GUI
@@ -69,6 +71,7 @@ pub(crate) async fn run(
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         resume_pending,
         uninstalled,
+        shutdown_requests,
         #[cfg(target_os = "macos")]
         armed_tx,
     )
@@ -110,6 +113,7 @@ impl Booted {
         config: Config,
         #[cfg(any(target_os = "macos", target_os = "windows"))] resume_pending: Arc<AtomicBool>,
         uninstalled: UnboundedReceiver<()>,
+        shutdown_requests: UnboundedReceiver<&'static str>,
         #[cfg(target_os = "macos")] armed_tx: std::sync::mpsc::Sender<()>,
     ) -> Option<Self> {
         // Read before `config` moves into the orchestrator.
@@ -119,7 +123,7 @@ impl Booted {
         let core = startup::bootstrap(config).await?;
         Some(Self {
             core,
-            signals: ShutdownSignals::install(),
+            signals: ShutdownSignals::install(shutdown_requests),
             uninstalled,
             capture_mouse_events,
             #[cfg(target_os = "macos")]
@@ -173,8 +177,8 @@ impl Recovered {
                     info!("no arming demand — exiting until wanted");
                     return None;
                 }
-                () = booted.signals.recv() => {
-                    info!("shutdown signal while dormant — exiting");
+                reason = booted.signals.recv() => {
+                    info!(reason, "shutdown requested while dormant — exiting");
                     return None;
                 }
                 Some(()) = booted.uninstalled.recv() => {
@@ -241,6 +245,7 @@ impl Wanted {
             ring_haptics,
             signals,
             uninstalled,
+            gesture_watcher: None,
             hook: None,
             capture_mouse_events,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -260,6 +265,9 @@ struct Armed {
     ring_haptics: server::RingHapticPlayer,
     signals: ShutdownSignals,
     uninstalled: UnboundedReceiver<()>,
+    /// Owns every HID++ capture session so deliberate exit can wait for
+    /// control and raw-touchpad restoration before terminating the process.
+    gesture_watcher: Option<GestureWatcher>,
     /// The OS hook, installed once Accessibility is granted and dropped on
     /// revoke (dropping the handle stops its thread).
     hook: Option<Hook>,
@@ -276,11 +284,11 @@ impl Armed {
         request_input_monitoring().await;
 
         // HID++ watchers need no Accessibility — start them up front.
-        startup::spawn_hidpp_watchers(
+        self.gesture_watcher = Some(startup::spawn_hidpp_watchers(
             &self.shared,
             &self.inputs,
             Arc::clone(&self.touchpad_monitor),
-        );
+        ));
         let mut watchers = startup::spawn_state_watchers(&self.shared);
 
         info!("openlogi-agent started");
@@ -290,7 +298,7 @@ impl Armed {
                 Some(device_key) = self.inputs.triggers.recv() => {
                     self.begin_action_ring(device_key.as_deref()).await;
                 }
-                () = self.signals.recv() => self.shut_down("shutdown signal"),
+                reason = self.signals.recv() => self.shut_down(reason),
                 // Uninstalled while running — leave through the same door so
                 // the event tap goes with us (#807).
                 Some(()) = self.uninstalled.recv() => self.shut_down("the app was uninstalled"),
@@ -459,6 +467,9 @@ impl Armed {
     }
 
     fn shut_down(&mut self, reason: &str) -> ! {
+        if let Some(mut watcher) = self.gesture_watcher.take() {
+            let _ = watcher.shutdown();
+        }
         shutdown::release_hook_and_exit(self.hook.take(), &mut self.inputs, reason)
     }
 }

@@ -82,6 +82,16 @@ pub struct DeviceCapturePlan {
 /// Read-only, lossless, coalescing view of the latest capture-plan snapshot.
 pub type SharedCapturePlans = watch::Receiver<Arc<Vec<DeviceCapturePlan>>>;
 
+/// Runtime capabilities and generation attached to a newly built capture plan.
+pub struct CapturePlanOptions {
+    /// Stable identity used by the durable touchpad raw-mode journal.
+    pub touchpad_journal_id: Option<String>,
+    /// Generation bumped after reconnect or wake to force firmware rearming.
+    pub rearm_generation: u64,
+    /// Whether macOS can attribute movement through its mouse hook.
+    pub os_mouse_hook_available: bool,
+}
+
 /// Back/Forward gesture maps that macOS must own through device-specific HID++
 /// capture because Bluetooth-direct CGEvents may carry no sender identity.
 #[must_use]
@@ -116,9 +126,11 @@ pub fn plan_for_device(
         config_key,
         route,
         app,
-        None,
-        rearm_generation,
-        os_mouse_hook_available,
+        CapturePlanOptions {
+            touchpad_journal_id: None,
+            rearm_generation,
+            os_mouse_hook_available,
+        },
     )
 }
 
@@ -131,10 +143,13 @@ pub fn plan_for_device_with_touchpad(
     config_key: &str,
     route: DeviceRoute,
     app: Option<&str>,
-    touchpad_journal_id: Option<String>,
-    rearm_generation: u64,
-    os_mouse_hook_available: bool,
+    options: CapturePlanOptions,
 ) -> DeviceCapturePlan {
+    let CapturePlanOptions {
+        touchpad_journal_id,
+        rearm_generation,
+        os_mouse_hook_available,
+    } = options;
     let bindings = button_bindings_for(config, Some(config_key), app);
     // Gesture-mode OS-hook controls normally stay native so the hook sees the
     // press. macOS Back/Forward are the exception below: HID++ owns their
@@ -278,8 +293,7 @@ mod tests {
     }
 
     fn physical_key() -> PhysicalDeviceKey {
-        PhysicalDeviceKey::parse("receiver:cafe:slot:2")
-            .expect("fixture should be a physical key")
+        PhysicalDeviceKey::parse("receiver:cafe:slot:2").expect("fixture should be a physical key")
     }
 
     fn plan_for_device(
@@ -612,9 +626,11 @@ mod tests {
             "unit:12345678",
             route(),
             None,
-            Some("unit:12345678".to_string()),
-            0,
-            true,
+            CapturePlanOptions {
+                touchpad_journal_id: Some("unit:12345678".to_string()),
+                rearm_generation: 0,
+                os_mouse_hook_available: true,
+            },
         );
         assert!(supported.target.spec.capture_touchpad);
         assert_eq!(
