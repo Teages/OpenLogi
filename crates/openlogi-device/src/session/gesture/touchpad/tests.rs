@@ -313,6 +313,21 @@ fn drops_incomplete_old_timestamp_and_preserves_identical_next_frame() {
 }
 
 #[test]
+fn oversized_contact_frame_counts_the_incomplete_frame_it_replaces() {
+    let mut assembler = assembler(Origin::UpperLeft);
+    assert!(
+        assembler
+            .push(chunk(20, [point(1, 100, 200), empty()], 2, false))
+            .is_none()
+    );
+
+    let outcome = assembler.push(chunk(21, [point(1, 100, 200), point(2, 300, 400)], 5, true));
+
+    assert!(matches!(outcome, Some(FrameOutcome::Cancel { .. })));
+    assert_eq!(assembler.take_dropped_frames(), 1);
+}
+
+#[test]
 fn rejects_mismatched_metadata_duplicates_and_spurious_reports() {
     let mut assembler = assembler(Origin::UpperLeft);
     assert!(

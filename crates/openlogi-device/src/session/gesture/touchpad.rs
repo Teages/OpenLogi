@@ -246,7 +246,9 @@ impl FrameAssembler {
         }
         if report.finger_count > 4 {
             let timestamp_us = self.timestamp.unwrap(report.timestamp);
-            self.pending = None;
+            if self.pending.take().is_some() {
+                self.dropped_frames = self.dropped_frames.saturating_add(1);
+            }
             self.rejected_timestamp = Some(report.timestamp);
             return Some(FrameOutcome::Cancel {
                 timestamp_us,
