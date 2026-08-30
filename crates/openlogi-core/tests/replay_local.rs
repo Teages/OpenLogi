@@ -70,10 +70,15 @@ fn replay_one(path: &Path) {
             // DroppedFrames carries its effect through the Cancel event that
             // follows it in the stream; everything else ends or no-ops.
             if kind == "CANCEL" {
-                if let Some(diag) = stroke.take() {
-                    deaths.push(format!("cancel@{index}: {}", diag.summarize()));
+                // OPENLOGI_REPLAY_IGNORE_CANCEL simulates the post-fix
+                // stream: drop-induced Cancels vanish and the stroke
+                // survives to the watchdog END.
+                if std::env::var_os("OPENLOGI_REPLAY_IGNORE_CANCEL").is_none() {
+                    if let Some(diag) = stroke.take() {
+                        deaths.push(format!("cancel@{index}: {}", diag.summarize()));
+                    }
+                    recognizer.cancel();
                 }
-                recognizer.cancel();
             } else if kind == "END" {
                 if let Some(diag) = stroke.take() {
                     match recognizer.end() {
