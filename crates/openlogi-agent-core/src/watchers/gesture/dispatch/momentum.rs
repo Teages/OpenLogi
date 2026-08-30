@@ -18,9 +18,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use openlogi_core::scroll::ScrollDelta;
 use openlogi_inject::SmoothScrollPhase;
 
-use super::super::{TouchpadScrollTuning, post_touchpad_scroll};
+use super::super::TouchpadScrollTuning;
 
 /// One momentum tick — the Options+ cadence (90.9 Hz).
 const TICK: Duration = Duration::from_millis(11);
@@ -62,7 +63,7 @@ impl TouchpadMomentum {
         let flag = stop.clone();
         let spawned = std::thread::Builder::new()
             .name("touchpad-momentum".to_string())
-            .spawn(move || run(tuning, &mut velocity, &flag));
+            .spawn(move || run(&mut velocity, &flag));
         if spawned.is_err() {
             // Scrolling simply stops at lift, as it did before momentum.
             return None;
@@ -79,22 +80,22 @@ impl TouchpadMomentum {
     }
 }
 
-fn run(tuning: TouchpadScrollTuning, velocity: &mut (f64, f64), stop: &AtomicBool) {
+/// `velocity` already lives in content pixels per second with the device's
+/// tuning applied — the tuning must not be re-applied on the way out, so the
+/// tail posts through the inject layer directly.
+fn run(velocity: &mut (f64, f64), stop: &AtomicBool) {
+    let mut ticks = 0_u32;
     loop {
         // The per-tick distance comes from the velocity *before* the decay,
         // matching the Options+ tick shape (velocity is per-tick distance
         // divided by the tick length). These continue the stroke's own
         // Began/Changed stream; the dispatcher skips its terminal when a
         // tail starts, so phases stay monotonic.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "sub-micrometre truncation of a per-tick distance is imperceptible"
-        )]
-        let (dx, dy) = (
-            (velocity.0 * TICK_SECONDS) as i64,
-            (velocity.1 * TICK_SECONDS) as i64,
+        openlogi_inject::post_touchpad_scroll(
+            ScrollDelta::pixels(velocity.0 * TICK_SECONDS, velocity.1 * TICK_SECONDS),
+            SmoothScrollPhase::Changed,
         );
-        post_touchpad_scroll(tuning, dx, dy, SmoothScrollPhase::Changed);
+        ticks += 1;
 
         if stop.load(Ordering::Acquire) {
             break;
@@ -108,7 +109,12 @@ fn run(tuning: TouchpadScrollTuning, velocity: &mut (f64, f64), stop: &AtomicBoo
         velocity.1 *= scale;
         std::thread::sleep(TICK);
     }
-    post_touchpad_scroll(tuning, 0, 0, SmoothScrollPhase::Ended);
+    openlogi_inject::post_touchpad_scroll(ScrollDelta::pixels(0.0, 0.0), SmoothScrollPhase::Ended);
+    tracing::debug!(
+        ticks,
+        speed = speed(*velocity),
+        "touchpad momentum tail ended"
+    );
 }
 
 /// The tail's starting content velocity, or `None` when the lift-off was
