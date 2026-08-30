@@ -433,6 +433,79 @@ pub fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     }
 }
 
+/// Axis of a native macOS DockSwipe animation (macOS 27+ WindowServer).
+///
+/// Swipe gestures map to the axis of their finger travel: horizontal swipes
+/// drive the finger-following Space-switch animation, vertical swipes drive
+/// Mission Control / App Exposé. The system reads streamed progress as
+/// screen-relative distance, roughly one unit per screen width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockSwipeMotion {
+    /// Side-to-side finger travel: switches between Spaces.
+    Horizontal,
+    /// Up-and-down finger travel: Mission Control / App Exposé.
+    Vertical,
+}
+
+/// Lifecycle role of one streamed DockSwipe event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockSwipePhase {
+    /// First event of a gesture; resets the accumulated progress and
+    /// invalidates any pending end-event resend.
+    Began,
+    /// Continuation event; `delta` is added to the accumulated progress.
+    Changed,
+    /// Finger released. The system decides commit-vs-spring-back from the
+    /// final motion direction relative to the accumulated progress, the
+    /// release rule Mac Mouse Fix observed on macOS 27.
+    End,
+    /// Gesture aborted: the animation always springs back.
+    Cancel,
+}
+
+/// Whether this host can drive native DockSwipe animations: macOS 27+ with
+/// the SkyLight `SLEventSetIOHIDEvent` bridge and the private `HIDEvent`
+/// class available. Cached after the first call; cheap enough to consult
+/// per frame.
+#[must_use]
+pub fn dock_swipe_supported() -> bool {
+    cfg_select! {
+        target_os = "macos" => {
+            macos::dockswipe::supported()
+        }
+        _ => {
+            false
+        }
+    }
+}
+
+/// Stream one DockSwipe event toward the WindowServer.
+///
+/// `delta` is the progress increment of a [`DockSwipePhase::Changed`] frame
+/// (1.0 ≈ one screen width); on [`DockSwipePhase::Began`] it seeds the
+/// accumulated progress with the opening frame's travel — the vertical
+/// consumer ignores a zero-progress Began, so the caller posts Began only
+/// once real travel exists. Exit velocity (last delta × 100) and the release
+/// sign rule live behind this boundary, mirroring Mac Mouse Fix's
+/// `TouchSimulator`. Returns `false` when the platform cannot stream or the
+/// event was dropped; a `false` on [`DockSwipePhase::Began`] means the caller
+/// should fall back to the bound action's discrete dispatch.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "streaming frames are fire-and-forget; only a failed begin changes dispatch behavior"
+)]
+pub fn post_dock_swipe(motion: DockSwipeMotion, phase: DockSwipePhase, delta: f64) -> bool {
+    cfg_select! {
+        target_os = "macos" => {
+            macos::dockswipe::post(motion, phase, delta)
+        }
+        _ => {
+            let _ = (motion, phase, delta);
+            false
+        }
+    }
+}
+
 /// Return the `/dev/input/eventN` node for the action-injector uinput device,
 /// initialising it if needed.
 ///
@@ -507,6 +580,38 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     use super::{HeldKey, HeldOutput, HoldTransition};
     use super::{QuantizedScroll, ScrollQuantizer};
+
+    /// Real-event smoke for the DockSwipe bridge: streams one horizontal
+    /// 0.65-progress gesture exactly like the verified prototype. Ignored by
+    /// default because it posts actual WindowServer events (it can switch the
+    /// active Space). Run it manually on hardware from an
+    /// Accessibility-granted terminal:
+    /// `cargo test -p openlogi-inject dockswipe_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore = "posts real DockSwipe events; run manually on hardware"]
+    #[cfg(target_os = "macos")]
+    fn dockswipe_smoke_streams_one_horizontal_space_swipe() {
+        use std::time::Duration;
+
+        use super::{DockSwipeMotion, DockSwipePhase, dock_swipe_supported, post_dock_swipe};
+
+        assert!(
+            dock_swipe_supported(),
+            "requires macOS 27+ with SkyLight SLEventSetIOHIDEvent and the HIDEvent class"
+        );
+        for i in 0..=16_u32 {
+            let (phase, delta) = match i {
+                0 => (DockSwipePhase::Began, 0.0),
+                16 => (DockSwipePhase::End, 0.65 / 16.0),
+                _ => (DockSwipePhase::Changed, 0.65 / 16.0),
+            };
+            assert!(
+                post_dock_swipe(DockSwipeMotion::Horizontal, phase, delta),
+                "frame {i} could not be posted"
+            );
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    }
 
     /// Synthetic high-resolution input: eight eighth-ticks must total exactly
     /// one Windows/Linux wheel detent (120 raw units). This is deterministic
