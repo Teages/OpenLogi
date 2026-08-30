@@ -1,11 +1,12 @@
 //! Decaying scroll momentum for the synthesized two-finger scroll.
 //!
 //! The recognizer stops at lift-off; the glide a trackpad shows afterwards
-//! lives here. Timing and decay constants mirror the Options+ agent's
-//! `processWheelInertia` (reverse-engineered from its unstripped binary):
-//! an 11 ms tick chain, a `×0.955` per-tick decay whose `|v|/(|v|+v₀)` term
-//! collapses the tail, and a content-velocity gate so deliberate slow
-//! scrolls stop dead.
+//! lives here. The cadence and the `×0.955` exponential mirror the Options+
+//! agent's `processWheelInertia` (reverse-engineered from its unstripped
+//! binary); the low-speed end fades out asymptotically instead — Options+
+//! collapses its tail with a `|v|/(|v|+v₀)` term, which hardware testing
+//! showed as a jolt, and a content-velocity gate keeps deliberate slow
+//! scrolls dead in place.
 //!
 //! The tail posts as ordinary scroll-phase `Changed` frames continuing the
 //! stroke's stream — on-session probing showed macOS 27 ignores synthesized
@@ -26,13 +27,17 @@ use super::super::TouchpadScrollTuning;
 const TICK: Duration = Duration::from_millis(11);
 /// Seconds per tick, the delta multiplier for a per-second velocity.
 const TICK_SECONDS: f64 = 0.011;
-/// Velocity multiplier applied every tick. 0.955 per 11 ms ≈ 0.97 per 60 Hz
-/// frame — between iOS `normal` and `fast` deceleration.
+/// Velocity multiplier applied every tick, pure exponential: 0.955 per 11 ms
+/// ≈ 0.97 per 60 Hz frame — between iOS `normal` and `fast` deceleration.
+/// Deliberately no low-speed convergence term: hardware testing showed the
+/// progressively harder brake it produces reads as a visible jolt right
+/// before the stop, where the native glide just fades out.
 const DECAY_PER_TICK: f64 = 0.955;
-/// The extra convergence term and the stop threshold, in content px/s: the
-/// ratio `|v|/(|v|+STOP)` leaves high speeds on the pure exponential and
-/// accelerates the fade once the tail reaches eye-tracking irrelevance.
-const STOP_PX_PER_S: f64 = 30.0;
+/// Where the tail loop stops, in content px/s — a tenth of a pixel per tick,
+/// already beneath the pixel quantizer's rounding threshold. The visible
+/// motion ends by fading through sub-pixel deltas into the quantizer's
+/// residual carry, not by braking.
+const STOP_PX_PER_S: f64 = 10.0;
 /// Lift-off speed below which no momentum starts, in content px/s. A
 /// deliberate slow scroll (≈ 40 mm/s of finger travel at the default gain)
 /// stays put; anything brisker glides. Scales with the device's sensitivity,
@@ -98,13 +103,11 @@ fn run(velocity: &mut (f64, f64), stop: &AtomicBool) {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let magnitude = speed(*velocity);
-        if magnitude <= STOP_PX_PER_S {
+        if speed(*velocity) <= STOP_PX_PER_S {
             break;
         }
-        let scale = DECAY_PER_TICK * magnitude / (magnitude + STOP_PX_PER_S);
-        velocity.0 *= scale;
-        velocity.1 *= scale;
+        velocity.0 *= DECAY_PER_TICK;
+        velocity.1 *= DECAY_PER_TICK;
         std::thread::sleep(TICK);
     }
     tracing::debug!(
@@ -152,12 +155,11 @@ mod tests {
     fn decay_shrinks_the_tail_and_preserves_direction() {
         let mut velocity = (3000.0, -4000.0);
         let magnitude = speed(velocity);
-        let scale = DECAY_PER_TICK * magnitude / (magnitude + STOP_PX_PER_S);
-        velocity.0 *= scale;
-        velocity.1 *= scale;
+        velocity.0 *= DECAY_PER_TICK;
+        velocity.1 *= DECAY_PER_TICK;
 
         let shrunk = speed(velocity);
-        assert!(shrunk < magnitude, "the tail must decay");
+        assert!((magnitude - shrunk - magnitude * (1.0 - DECAY_PER_TICK)).abs() < 1e-9);
         // Direction survives: both components keep their sign and ratio.
         assert!((velocity.0 / velocity.1 - 3000.0 / -4000.0).abs() < 1e-12);
     }
