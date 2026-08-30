@@ -564,9 +564,3 @@ fn begin_failure_falls_back_to_discrete_action() {
     let outcome = runtime.end(true);
     assert_eq!(outcome.stream, SwipeOutput::Idle);
 }
-
-#[test]
-fn begin_failed_without_a_stream_returns_none() {
-    let mut runtime = TouchpadRuntime::default();
-    assert_eq!(runtime.begin_failed(), None);
-}

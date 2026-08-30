@@ -1500,21 +1500,15 @@ pub(super) mod dockswipe {
     const END_RESEND_DELAYS: [Duration; 2] =
         [Duration::from_millis(200), Duration::from_millis(500)];
 
-    /// Accumulated progress and last delta of the running gesture, its owner
-    /// (the capture session that opened it), and a generation counter that
+    /// The running gesture's owner (the capture session that opened it), its
+    /// accumulated progress and last delta, and a generation counter that
     /// invalidates pending end-event resends when a new gesture begins. One
     /// stream at a time — the DockSwipe system state is global — so a Began
     /// from a new owner supersedes the previous animation and the previous
     /// owner's later frames are rejected.
-    static STREAM: LazyLock<Mutex<Stream>> = LazyLock::new(|| {
-        Mutex::new(Stream {
-            owner: 0,
-            progress: 0.0,
-            last_delta: 0.0,
-            generation: 0,
-        })
-    });
+    static STREAM: LazyLock<Mutex<Stream>> = LazyLock::new(|| Mutex::new(Stream::default()));
 
+    #[derive(Debug, Default)]
     struct Stream {
         owner: u64,
         progress: f64,
@@ -1545,20 +1539,58 @@ pub(super) mod dockswipe {
         phase: DockSwipePhase,
         delta: f64,
     ) -> bool {
-        let Some(event_plan) = plan_event(owner, phase, delta) else {
-            // Zero-delta continuation: Mac Mouse Fix skips those too.
-            return false;
-        };
+        if phase == DockSwipePhase::Began {
+            return post_began(owner, motion, delta);
+        }
         let motion_id = match motion {
             DockSwipeMotion::Horizontal => 1,
             DockSwipeMotion::Vertical => 2,
         };
+        let Ok(mut stream) = STREAM.lock() else {
+            tracing::warn!("dock swipe stream mutex poisoned");
+            return false;
+        };
+        let event_plan = if phase == DockSwipePhase::Changed {
+            stream.advance(owner, delta)
+        } else {
+            stream.finish(owner, phase)
+        };
+        let Some(event_plan) = event_plan else {
+            // Zero-delta continuations are skipped (Mac Mouse Fix skips them
+            // too), and frames from a superseded owner are rejected.
+            return false;
+        };
+        drop(stream);
         let posted = post_event(motion_id, &event_plan);
         if posted && let DockSwipePhase::End | DockSwipePhase::Cancel = phase {
             schedule_end_resend(motion_id, event_plan);
         }
         if !posted {
             tracing::warn!(?motion, ?phase, "dock swipe event could not be posted");
+        }
+        posted
+    }
+
+    /// Open a gesture as one transaction: the Began event is delivered while
+    /// the stream lock is held, and ownership (generation, progress) is
+    /// committed only on success. A failed delivery therefore leaves the
+    /// previous owner's gesture fully alive — its frames and its end —
+    /// instead of stranding it.
+    fn post_began(owner: u64, motion: DockSwipeMotion, delta: f64) -> bool {
+        let motion_id = match motion {
+            DockSwipeMotion::Horizontal => 1,
+            DockSwipeMotion::Vertical => 2,
+        };
+        let Ok(mut stream) = STREAM.lock() else {
+            tracing::warn!("dock swipe stream mutex poisoned");
+            return false;
+        };
+        let event_plan = stream.began_plan(delta);
+        let posted = post_event(motion_id, &event_plan);
+        if posted {
+            stream.commit_began(owner, event_plan.generation, delta);
+        } else {
+            tracing::warn!(?motion, "dock swipe Began could not be posted");
         }
         posted
     }
@@ -1572,54 +1604,63 @@ pub(super) mod dockswipe {
         generation: u64,
     }
 
-    /// Apply `phase`/`delta` to the stream state and derive the event to post.
-    fn plan_event(owner: u64, phase: DockSwipePhase, delta: f64) -> Option<EventPlan> {
-        let Ok(mut stream) = STREAM.lock() else {
-            tracing::warn!("dock swipe stream mutex poisoned");
-            return None;
-        };
-        if phase != DockSwipePhase::Began && stream.owner != owner {
-            // A superseded session's frames must not touch the new owner's
-            // animation.
-            return None;
+    impl Stream {
+        /// Plan (without posting or committing) the Began event for `owner`.
+        fn began_plan(&self, delta: f64) -> EventPlan {
+            // Mac Mouse Fix's Began carries the stroke's first delta, which seeds
+            // the accumulator.
+            EventPlan {
+                options: PHASE_BEGAN << PHASE_SHIFT,
+                progress: delta,
+                velocity: None,
+                generation: self.generation.wrapping_add(1),
+            }
         }
-        match phase {
-            DockSwipePhase::Began => {
-                stream.owner = owner;
-                stream.generation = stream.generation.wrapping_add(1);
-                // Mac Mouse Fix's Began carries the stroke's first delta,
-                // which seeds the accumulator.
-                stream.progress = delta;
-                stream.last_delta = delta;
-                Some(EventPlan {
-                    options: PHASE_BEGAN << PHASE_SHIFT,
-                    progress: delta,
-                    velocity: None,
-                    generation: stream.generation,
-                })
+
+        /// Commit a successfully delivered Began: `owner` takes the stream over
+        /// and its Began progress seeds the accumulator.
+        fn commit_began(&mut self, owner: u64, generation: u64, delta: f64) {
+            self.owner = owner;
+            self.generation = generation;
+            self.progress = delta;
+            self.last_delta = delta;
+        }
+
+        /// Plan a continuation frame; `None` for zero-delta frames (Mac Mouse Fix
+        /// skips them) and for frames from a superseded owner, whose delivery
+        /// must not touch the new owner's animation.
+        fn advance(&mut self, owner: u64, delta: f64) -> Option<EventPlan> {
+            if self.owner != owner {
+                return None;
             }
-            DockSwipePhase::Changed if delta != 0.0 => {
-                stream.progress += delta;
-                stream.last_delta = delta;
-                Some(EventPlan {
-                    options: PHASE_CHANGED << PHASE_SHIFT,
-                    progress: stream.progress,
-                    velocity: None,
-                    generation: stream.generation,
-                })
+            if delta == 0.0 {
+                return None;
             }
-            DockSwipePhase::End | DockSwipePhase::Cancel => {
-                let velocity = stream.last_delta * EXIT_VELOCITY_SCALE;
-                Some(EventPlan {
-                    options: release_phase(phase, stream.progress, stream.last_delta)
-                        << PHASE_SHIFT,
-                    progress: stream.progress,
-                    velocity: Some(velocity),
-                    generation: stream.generation,
-                })
+            self.progress += delta;
+            self.last_delta = delta;
+            Some(EventPlan {
+                options: PHASE_CHANGED << PHASE_SHIFT,
+                progress: self.progress,
+                velocity: None,
+                generation: self.generation,
+            })
+        }
+
+        /// Plan the end-of-stream event. The release sign rule decides
+        /// commit-vs-spring-back: a release still moving along the accumulated
+        /// travel commits (`ENDED`), one moving against it springs back
+        /// (`CANCELLED`).
+        fn finish(&mut self, owner: u64, phase: DockSwipePhase) -> Option<EventPlan> {
+            if self.owner != owner {
+                return None;
             }
-            // Zero-delta continuations post nothing; Mac Mouse Fix skips them.
-            DockSwipePhase::Changed => None,
+            let velocity = self.last_delta * EXIT_VELOCITY_SCALE;
+            Some(EventPlan {
+                options: release_phase(phase, self.progress, self.last_delta) << PHASE_SHIFT,
+                progress: self.progress,
+                velocity: Some(velocity),
+                generation: self.generation,
+            })
         }
     }
 
@@ -1841,10 +1882,42 @@ pub(super) mod dockswipe {
     mod tests {
         use super::{
             FIELD_DOCK_SWIPE_FLAVOR, FIELD_DOCK_SWIPE_MOTION, FIELD_DOCK_SWIPE_PROGRESS,
-            FIELD_VELOCITY_X, PHASE_BEGAN, PHASE_CANCELLED, PHASE_ENDED, PHASE_SHIFT,
+            FIELD_VELOCITY_X, PHASE_BEGAN, PHASE_CANCELLED, PHASE_ENDED, PHASE_SHIFT, Stream,
             release_phase,
         };
         use crate::inject::DockSwipePhase;
+
+        #[test]
+        fn failed_began_delivery_leaves_the_previous_owner_intact() {
+            let mut stream = Stream::default();
+            let plan = stream.began_plan(0.1);
+            stream.commit_began(1, plan.generation, 0.1);
+            assert!(stream.advance(1, 0.1).is_some());
+
+            // Owner 2 plans a Began whose delivery then fails: nothing is
+            // committed, so owner 1's gesture stays alive — its frames and
+            // its end still work — while owner 2's frames stay rejected.
+            let _failed_plan = stream.began_plan(0.2);
+            assert!(stream.advance(1, -0.05).is_some());
+            assert!(stream.finish(1, DockSwipePhase::End).is_some());
+            assert!(stream.advance(2, 0.2).is_none());
+            assert!(stream.finish(2, DockSwipePhase::Cancel).is_none());
+        }
+
+        #[test]
+        fn committed_began_supersedes_the_previous_owner() {
+            let mut stream = Stream::default();
+            let plan = stream.began_plan(0.1);
+            stream.commit_began(1, plan.generation, 0.1);
+
+            // A delivered Began hands the stream over: the previous owner's
+            // frames are rejected from that point on.
+            let plan = stream.began_plan(0.2);
+            stream.commit_began(2, plan.generation, 0.2);
+            assert!(stream.advance(1, 0.1).is_none());
+            assert!(stream.finish(1, DockSwipePhase::End).is_none());
+            assert!(stream.advance(2, 0.1).is_some());
+        }
 
         #[test]
         fn dock_swipe_field_ids_match_iohid_event_types() {
