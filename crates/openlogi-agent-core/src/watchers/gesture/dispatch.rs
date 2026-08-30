@@ -1,5 +1,6 @@
 //! Resolve captured HID++ inputs against the active per-device plan.
 
+mod momentum;
 mod wheel;
 
 use std::collections::{BTreeMap, HashMap};
@@ -12,6 +13,7 @@ use openlogi_hid::CapturedInput;
 use openlogi_inject::SmoothScrollPhase;
 use tracing::debug;
 
+use self::momentum::TouchpadMomentum;
 use self::wheel::{ScrollScale, WheelAccumulators, WheelOutput, WheelRotation};
 use super::{GestureOutputs, TouchpadScrollTuning};
 use crate::capture_plan::DispatchPlan;
@@ -108,6 +110,14 @@ enum TouchpadOutput {
         dy_um: i64,
         phase: SmoothScrollPhase,
     },
+    /// The scroll stream closed. The zero-delta phase event is posted by the
+    /// dispatcher; `exit_velocity` (centroid micrometres per second, tracked
+    /// as an exponential average over the stroke) seeds momentum on a clean
+    /// end and is absent on a cancellation.
+    ScrollEnd {
+        phase: SmoothScrollPhase,
+        exit_velocity_um_per_s: Option<(f64, f64)>,
+    },
 }
 
 #[derive(Default)]
@@ -118,6 +128,15 @@ struct TouchpadRuntime {
     /// Whether this stroke already opened its scroll stream, so the next
     /// delta knows to continue rather than begin one.
     scroll_streaming: bool,
+    /// Smoothed centroid velocity over the stroke, micrometres per second:
+    /// fast-attack, slow-release (α = 0.01 per frame), the filter the
+    /// Options+ agent feeds its inertia with — a brief slowdown before
+    /// lift-off must not kill a glide.
+    scroll_velocity_um_per_s: (f64, f64),
+    /// Timestamp of the last frame seen this stroke, the dt baseline for the
+    /// velocity filter — recorded on every frame, so the first streamed
+    /// delta (which already spans one frame of travel) gets a real dt too.
+    last_frame_us: Option<u64>,
 }
 
 impl TouchpadRuntime {
@@ -131,6 +150,15 @@ impl TouchpadRuntime {
             self.frozen_bindings = Some(current_bindings.clone());
             self.frozen_actions_enabled = actions_enabled;
         }
+        let timestamp_us = frame.timestamp_us;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "frame timestamps stay far below 2^53 microseconds"
+        )]
+        let dt_us = self.last_frame_us.map_or(f64::NAN, |previous| {
+            (timestamp_us.saturating_sub(previous)) as f64
+        });
+        self.last_frame_us = Some(timestamp_us);
         match self.recognizer.update(frame) {
             GestureRecognition::Gesture(trigger)
                 if self.frozen_actions_enabled && actions_enabled =>
@@ -149,6 +177,7 @@ impl TouchpadRuntime {
                     SmoothScrollPhase::Began
                 };
                 self.scroll_streaming = true;
+                self.track_scroll_velocity(dt_us, dx_um, dy_um);
                 TouchpadOutput::Scroll {
                     dx_um,
                     dy_um,
@@ -185,16 +214,45 @@ impl TouchpadRuntime {
 
     /// Terminate an open scroll stream, if any. Scrolling travelled past the
     /// tap limits, so a scrolled stroke can never also resolve a tap and the
-    /// two outcomes never compete.
+    /// two outcomes never compete. A cancellation discards the velocity —
+    /// momentum must not grow out of a stroke the stream rejected.
     fn close_scroll_stream(&mut self, phase: SmoothScrollPhase) -> Option<TouchpadOutput> {
+        let velocity = self.scroll_velocity_um_per_s;
+        self.scroll_velocity_um_per_s = (0.0, 0.0);
+        self.last_frame_us = None;
         self.scroll_streaming.then(|| {
             self.scroll_streaming = false;
-            TouchpadOutput::Scroll {
-                dx_um: 0,
-                dy_um: 0,
+            TouchpadOutput::ScrollEnd {
                 phase,
+                exit_velocity_um_per_s: (phase == SmoothScrollPhase::Ended).then_some(velocity),
             }
         })
+    }
+
+    /// Fold one frame's delta into the exit-velocity filter.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "per-frame deltas stay far below 2^53 micrometres"
+    )]
+    fn track_scroll_velocity(&mut self, dt_us: f64, dx: i64, dy: i64) {
+        const RELEASE: f64 = 0.99;
+        const ATTACK: f64 = 0.01;
+        if !dt_us.is_finite() || dt_us <= 0.0 {
+            return;
+        }
+        let seconds = dt_us / 1_000_000.0;
+        let raw = (dx as f64 / seconds, dy as f64 / seconds);
+        let smoothed = &mut self.scroll_velocity_um_per_s;
+        smoothed.0 = if raw.0.abs() > smoothed.0.abs() {
+            raw.0
+        } else {
+            smoothed.0 * RELEASE + raw.0 * ATTACK
+        };
+        smoothed.1 = if raw.1.abs() > smoothed.1.abs() {
+            raw.1
+        } else {
+            smoothed.1 * RELEASE + raw.1 * ATTACK
+        };
     }
 
     fn action(&self, trigger: ButtonId) -> Option<(ButtonId, Action)> {
@@ -226,6 +284,8 @@ pub(super) struct InputDispatcher {
     wheels: SessionWheels,
     gesture_presses: GesturePresses,
     touchpads: SessionTouchpads,
+    /// The one running scroll-momentum tail. A new touch replaces it.
+    momentum: Option<TouchpadMomentum>,
 }
 
 impl InputDispatcher {
@@ -236,11 +296,22 @@ impl InputDispatcher {
             wheels: SessionWheels::default(),
             gesture_presses: GesturePresses::default(),
             touchpads: SessionTouchpads::default(),
+            momentum: None,
+        }
+    }
+
+    /// Kill the scroll-momentum tail, if one is gliding. The thread posts its
+    /// own terminal zero-delta end on the next tick, keeping the momentum
+    /// phase machine single-ownered.
+    fn stop_momentum(&mut self) {
+        if let Some(momentum) = self.momentum.take() {
+            momentum.stop();
         }
     }
 
     /// Cancel every input lifecycle retained for one capture session.
     pub(super) fn cancel_session(&mut self, session: &HidppSessionId) {
+        self.stop_momentum();
         self.outputs.cancel_session(session);
         self.wheels.cancel_session(session);
         self.gesture_presses.cancel_session(session);
@@ -332,6 +403,8 @@ impl InputDispatcher {
                 }
             }
             CapturedInput::TouchpadFrame(frame) => {
+                // Touch re-lands: stop any gliding tail before the new stroke.
+                self.stop_momentum();
                 let tuning = TouchpadScrollTuning::from_plan(plan);
                 let outcome = self.touchpads.for_session(session).update(
                     &frame,
@@ -341,14 +414,10 @@ impl InputDispatcher {
                 Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
             }
             CapturedInput::TouchpadEnd => {
-                let tuning = TouchpadScrollTuning::from_plan(plan);
-                let outcome = self
-                    .touchpads
-                    .for_session(session)
-                    .end(touchpad_actions_enabled);
-                Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
+                self.end_touchpad_stroke(session, plan, key, touchpad_actions_enabled);
             }
             CapturedInput::TouchpadCancel => {
+                self.stop_momentum();
                 let tuning = TouchpadScrollTuning::from_plan(plan);
                 let outcome = self.touchpads.for_session(session).cancel();
                 Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
@@ -403,6 +472,31 @@ impl InputDispatcher {
             .dispatch_hidpp_button_pulse(session, button, binding);
     }
 
+    /// End one touchpad stroke: route the terminal (zero-delta phase event,
+    /// or a tap that survived the scroll travel limits) and, when the
+    /// lift-off was fast enough, hand the exit velocity to a momentum tail.
+    fn end_touchpad_stroke(
+        &mut self,
+        session: &HidppSessionId,
+        plan: &DispatchPlan,
+        key: &str,
+        actions_enabled: bool,
+    ) {
+        let tuning = TouchpadScrollTuning::from_plan(plan);
+        let outcome = self.touchpads.for_session(session).end(actions_enabled);
+        let exit_velocity = match &outcome {
+            TouchpadOutput::ScrollEnd {
+                exit_velocity_um_per_s,
+                ..
+            } => *exit_velocity_um_per_s,
+            _ => None,
+        };
+        Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
+        if let Some(exit_velocity) = exit_velocity {
+            self.momentum = TouchpadMomentum::start(tuning, exit_velocity);
+        }
+    }
+
     fn route_touchpad_output(
         outputs: &GestureOutputs,
         tuning: TouchpadScrollTuning,
@@ -420,6 +514,11 @@ impl InputDispatcher {
                 dy_um,
                 phase,
             } => super::post_touchpad_scroll(tuning, dx_um, dy_um, phase),
+            TouchpadOutput::ScrollEnd { phase, .. } => {
+                // Zero distance: the phase transition itself closes the
+                // gesture stream; momentum, if any, is the caller's call.
+                super::post_touchpad_scroll(tuning, 0, 0, phase);
+            }
         }
     }
 }

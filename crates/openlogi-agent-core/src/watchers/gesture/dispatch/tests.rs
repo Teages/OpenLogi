@@ -215,13 +215,13 @@ fn touchpad_scroll_streams_phases_and_terminates_on_end() {
             phase: SmoothScrollPhase::Changed
         }
     );
-    // The stroke ends without a tap: only the scroll terminator routes.
+    // The stroke ends without a tap: only the scroll terminator routes,
+    // carrying the exit velocity for the momentum gate.
     assert_eq!(
         runtime.end(true),
-        TouchpadOutput::Scroll {
-            dx_um: 0,
-            dy_um: 0,
-            phase: SmoothScrollPhase::Ended
+        TouchpadOutput::ScrollEnd {
+            phase: SmoothScrollPhase::Ended,
+            exit_velocity_um_per_s: Some((0.0, 0.0)),
         }
     );
     assert_eq!(runtime.end(true), TouchpadOutput::Idle);
@@ -267,10 +267,9 @@ fn touchpad_scroll_survives_disabled_actions_and_cancels_cleanly() {
     );
     assert_eq!(
         runtime.cancel(),
-        TouchpadOutput::Scroll {
-            dx_um: 0,
-            dy_um: 0,
-            phase: SmoothScrollPhase::Cancelled
+        TouchpadOutput::ScrollEnd {
+            phase: SmoothScrollPhase::Cancelled,
+            exit_velocity_um_per_s: None,
         }
     );
     assert_eq!(runtime.cancel(), TouchpadOutput::Idle);
@@ -316,5 +315,64 @@ fn touchpad_scroll_tuning_scales_and_inverts_content_deltas() {
         tuning(TouchpadScrollSensitivity::DEFAULT, true).content_delta(1_000, 2_000),
         25.0,
         -50.0,
+    );
+}
+
+#[test]
+fn touchpad_scroll_exit_velocity_tracks_frames_and_releases_slowly() {
+    use openlogi_core::touchpad::TouchContact;
+
+    let travelling = |timestamp_us: u64, travelled: u32| {
+        TouchFrame::new(
+            timestamp_us,
+            false,
+            vec![
+                TouchContact {
+                    id: 1,
+                    x_um: 40_000 + travelled,
+                    y_um: 50_000,
+                },
+                TouchContact {
+                    id: 2,
+                    x_um: 60_000 + travelled,
+                    y_um: 50_000,
+                },
+            ],
+        )
+        .expect("valid frame")
+    };
+    let bindings = BTreeMap::from([(ButtonId::TouchpadTwoFingerTap, Action::Copy)]);
+    let mut runtime = TouchpadRuntime::default();
+
+    // Steady 3 mm per 25 ms frame = 120 mm/s to the right.
+    runtime.update(&travelling(0, 0), &bindings, true);
+    runtime.update(&travelling(25_000, 2_000), &bindings, true);
+    runtime.update(&travelling(50_000, 5_000), &bindings, true);
+    let TouchpadOutput::ScrollEnd {
+        exit_velocity_um_per_s: Some((vx, _vy)),
+        ..
+    } = runtime.end(true)
+    else {
+        panic!("a streamed stroke must report its exit velocity");
+    };
+    assert!((vx - 120_000.0).abs() < 1.0, "got {vx} µm/s");
+
+    // One slow frame right before lift does not kill the glide: the filter
+    // releases at α = 0.01, so the smoothed speed stays near the fast phase.
+    let mut runtime = TouchpadRuntime::default();
+    runtime.update(&travelling(0, 0), &bindings, true);
+    runtime.update(&travelling(25_000, 2_000), &bindings, true);
+    runtime.update(&travelling(50_000, 5_000), &bindings, true);
+    runtime.update(&travelling(75_000, 5_500), &bindings, true);
+    let TouchpadOutput::ScrollEnd {
+        exit_velocity_um_per_s: Some((vx, _)),
+        ..
+    } = runtime.end(true)
+    else {
+        panic!("streamed stroke");
+    };
+    assert!(
+        vx > 100_000.0,
+        "a single slow frame must not collapse the exit velocity, got {vx}"
     );
 }

@@ -433,6 +433,21 @@ pub fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     }
 }
 
+/// Lifecycle phase of one decaying momentum frame — the tail a trackpad
+/// shows after the fingers lift. Distinct from [`SmoothScrollPhase`], which
+/// drives the *gesture's* scroll-phase field: momentum lives on the momentum
+/// field and has no cancelled variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MomentumScrollPhase {
+    /// First momentum frame after the gesture's scroll stream ended.
+    Began,
+    /// An intermediate decaying frame.
+    Changed,
+    /// Final frame; carries any correction. Zero-distance frames are the
+    /// norm here — the phase transition is the payload.
+    Ended,
+}
+
 /// Content distance one wheel detent represents when a touchpad scroll has to
 /// fall back to wheel-class output, matching the points-per-tick scale macOS
 /// continuous scrolling carries in its native events.
@@ -456,6 +471,30 @@ pub fn post_touchpad_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     cfg_select! {
         target_os = "macos" => {
             macos::post_touchpad_scroll(delta, phase);
+        }
+        _ => {
+            let _ = phase;
+            post_scroll(ScrollDelta::wheel_ticks(
+                delta.x() / PIXELS_PER_WHEEL_TICK,
+                delta.y() / PIXELS_PER_WHEEL_TICK,
+            ));
+        }
+    }
+}
+
+/// Synthesise one frame of decaying touchpad-scroll momentum.
+///
+/// Same conventions as [`post_touchpad_scroll`]; the caller drives the decay
+/// and owns the phase machine (begin → changed → end), mirroring how the
+/// Options+ agent runs its inertia on a private timer. Zero-distance end
+/// frames stay meaningful on macOS.
+pub fn post_touchpad_momentum_scroll(delta: ScrollDelta, phase: MomentumScrollPhase) {
+    if !delta.is_finite() {
+        return;
+    }
+    cfg_select! {
+        target_os = "macos" => {
+            macos::post_touchpad_momentum_scroll(delta, phase);
         }
         _ => {
             let _ = phase;
