@@ -263,6 +263,10 @@ pub struct TouchpadScrollPanel {
     slider_state: Option<Entity<SliderState>>,
     slider_sub: Option<Subscription>,
     slider_key: Option<String>,
+    /// Whether a drag is between its first `Change` and its `Release`. While
+    /// set, the thumb shows the dragged value, which the committed config
+    /// only catches up to on release.
+    dragging: bool,
     _state_obs: Subscription,
 }
 
@@ -287,6 +291,7 @@ impl TouchpadScrollPanel {
             slider_state: None,
             slider_sub: None,
             slider_key: None,
+            dragging: false,
             _state_obs: state_obs,
         }
     }
@@ -301,15 +306,17 @@ impl TouchpadScrollPanel {
         if self.slider_key.as_deref() == Some(&key.to_string())
             && let Some(slider_state) = &self.slider_state
         {
-            // Only re-seat the thumb when the config value resolves to a
-            // different sensitivity than the thumb currently rests on, so a
-            // drag in progress is never yanked back.
-            slider_state.update(cx, |state, cx| {
-                let thumb = TouchpadScrollSensitivity::from_rounded(state.value().start());
-                if thumb != sensitivity {
-                    state.set_value(f32::from(sensitivity), window, cx);
-                }
-            });
+            // Re-seat the thumb when the config value resolves to a different
+            // sensitivity than the thumb rests on — never during a drag,
+            // whose intermediate values the config only adopts on release.
+            if !self.dragging {
+                slider_state.update(cx, |state, cx| {
+                    let thumb = TouchpadScrollSensitivity::from_rounded(state.value().start());
+                    if thumb != sensitivity {
+                        state.set_value(f32::from(sensitivity), window, cx);
+                    }
+                });
+            }
             return;
         }
 
@@ -319,7 +326,8 @@ impl TouchpadScrollPanel {
                 .min(f32::from(TouchpadScrollSensitivity::MIN))
                 .default_value(f32::from(sensitivity))
         });
-        let slider_sub = cx.subscribe(&slider_state, |_panel, _slider, event: &SliderEvent, cx| {
+        let slider_sub = cx.subscribe(&slider_state, |panel, _slider, event: &SliderEvent, cx| {
+            panel.dragging = !matches!(event, SliderEvent::Release(_));
             if let SliderEvent::Release(value) = event {
                 let sensitivity = TouchpadScrollSensitivity::from_rounded(value.start());
                 AppState::update(cx, |state, cx| {
@@ -358,14 +366,17 @@ impl Render for TouchpadScrollPanel {
         v_flex()
             .gap_2()
             .child(
-                div()
-                    .text_body()
-                    .text_color(pal.text_primary)
-                    .child(tr!("Two-finger scroll speed")),
+                v_flex()
+                    .child(
+                        div()
+                            .text_body()
+                            .text_color(pal.text_primary)
+                            .child(tr!("Two-finger scroll speed")),
+                    )
+                    .child(div().text_caption().text_color(pal.text_muted).child(tr!(
+                        "Scales the two-finger scrolling OpenLogi synthesizes while gestures are enabled."
+                    ))),
             )
-            .child(div().text_caption().text_color(pal.text_muted).child(tr!(
-                "Scales the two-finger scrolling OpenLogi synthesizes while gestures are enabled."
-            )))
             .child(Slider::new(&slider_state).horizontal())
     }
 }
