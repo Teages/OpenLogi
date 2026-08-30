@@ -34,6 +34,7 @@ use openlogi_hid::{
     CaptureChannel, CaptureSessionOutcome, CapturedInput, FileTouchpadJournalStore, GestureError,
     PendingCaptureRestore, run_capture_session_with_registry_spec,
 };
+use openlogi_inject::SmoothScrollPhase;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -78,6 +79,39 @@ impl GestureOutputs {
             openlogi_inject::post_scroll(delta);
         }
     }
+}
+
+/// Synthesize one frame of two-finger scrolling from a micrometre centroid
+/// delta. The capture session owns the pad's raw stream, which switches its
+/// firmware scroll translation off — OpenLogi restores the scrolling itself,
+/// the contract Options+ keeps on the same hardware.
+fn post_touchpad_scroll(dx: i64, dy: i64, phase: SmoothScrollPhase) {
+    // Fingers right / down move content right / down (natural scrolling).
+    // ScrollDelta's wheel convention is +x view-right / +y view-up, so
+    // content-following maps the horizontal axis negated and the vertical
+    // axis as-is; the inject layer re-orients for hosts whose wheel
+    // convention matches content-following instead.
+    openlogi_inject::post_touchpad_scroll(
+        ScrollDelta::pixels(
+            micrometres_to_content_pixels(-dx),
+            micrometres_to_content_pixels(dy),
+        ),
+        phase,
+    );
+}
+
+/// Two-finger scroll gain in pixels of content per micrometre of centroid
+/// travel: 25 px/mm keeps the Casa Touch's 75 mm-tall surface good for a
+/// ~1.9k px full-height stroke, the distance a Magic Trackpad covers at its
+/// default tracking feel.
+const TOUCHPAD_SCROLL_PIXELS_PER_UM: f64 = 0.025;
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "micrometre deltas from a 117 x 76 mm pad stay far below 2^53"
+)]
+fn micrometres_to_content_pixels(um: i64) -> f64 {
+    um as f64 * TOUCHPAD_SCROLL_PIXELS_PER_UM
 }
 
 /// Unique owner of the capture-manager thread and its graceful shutdown.

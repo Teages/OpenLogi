@@ -9,6 +9,7 @@ use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection, defaul
 use openlogi_core::config::ThumbwheelSensitivity;
 use openlogi_core::touchpad::{GestureRecognition, TouchFrame, TouchpadGestureRecognizer};
 use openlogi_hid::CapturedInput;
+use openlogi_inject::SmoothScrollPhase;
 use tracing::debug;
 
 use self::wheel::{ScrollScale, WheelAccumulators, WheelOutput, WheelRotation};
@@ -92,11 +93,31 @@ impl SessionWheels {
     }
 }
 
+/// One routed outcome of feeding a frame (or a stroke boundary) to a
+/// session's touchpad runtime.
+#[derive(Debug, PartialEq)]
+enum TouchpadOutput {
+    /// Nothing to dispatch for this frame.
+    Idle,
+    /// A committed gesture trigger with its resolved action.
+    Action { trigger: ButtonId, action: Action },
+    /// One synthesized two-finger scroll frame: the centroid's travel in
+    /// micrometres plus its position in the scroll gesture's phase stream.
+    Scroll {
+        dx_um: i64,
+        dy_um: i64,
+        phase: SmoothScrollPhase,
+    },
+}
+
 #[derive(Default)]
 struct TouchpadRuntime {
     recognizer: TouchpadGestureRecognizer,
     frozen_bindings: Option<BTreeMap<ButtonId, Action>>,
     frozen_actions_enabled: bool,
+    /// Whether this stroke already opened its scroll stream, so the next
+    /// delta knows to continue rather than begin one.
+    scroll_streaming: bool,
 }
 
 impl TouchpadRuntime {
@@ -105,7 +126,7 @@ impl TouchpadRuntime {
         frame: &TouchFrame,
         current_bindings: &BTreeMap<ButtonId, Action>,
         actions_enabled: bool,
-    ) -> Option<(ButtonId, Action)> {
+    ) -> TouchpadOutput {
         if self.frozen_bindings.is_none() {
             self.frozen_bindings = Some(current_bindings.clone());
             self.frozen_actions_enabled = actions_enabled;
@@ -115,28 +136,65 @@ impl TouchpadRuntime {
                 if self.frozen_actions_enabled && actions_enabled =>
             {
                 self.action(trigger)
+                    .map_or(TouchpadOutput::Idle, |(trigger, action)| {
+                        TouchpadOutput::Action { trigger, action }
+                    })
             }
-            GestureRecognition::Pending
-            | GestureRecognition::NativeScroll
-            | GestureRecognition::Gesture(_) => None,
+            GestureRecognition::Scroll { dx_um, dy_um } => {
+                // Scrolling replaces the firmware translation the capture
+                // switched off, so it flows regardless of action bindings.
+                let phase = if self.scroll_streaming {
+                    SmoothScrollPhase::Changed
+                } else {
+                    SmoothScrollPhase::Began
+                };
+                self.scroll_streaming = true;
+                TouchpadOutput::Scroll {
+                    dx_um,
+                    dy_um,
+                    phase,
+                }
+            }
+            GestureRecognition::Pending | GestureRecognition::Gesture(_) => TouchpadOutput::Idle,
         }
     }
 
-    fn end(&mut self, actions_enabled: bool) -> Option<(ButtonId, Action)> {
+    fn end(&mut self, actions_enabled: bool) -> TouchpadOutput {
         let action = self
             .recognizer
             .end()
             .filter(|_| self.frozen_actions_enabled && actions_enabled)
             .and_then(|trigger| self.action(trigger));
+        let terminal = self.close_scroll_stream(SmoothScrollPhase::Ended);
         self.frozen_bindings = None;
         self.frozen_actions_enabled = false;
-        action
+        terminal.unwrap_or_else(|| {
+            action.map_or(TouchpadOutput::Idle, |(trigger, action)| {
+                TouchpadOutput::Action { trigger, action }
+            })
+        })
     }
 
-    fn cancel(&mut self) {
+    fn cancel(&mut self) -> TouchpadOutput {
+        let terminal = self.close_scroll_stream(SmoothScrollPhase::Cancelled);
         self.recognizer.cancel();
         self.frozen_bindings = None;
         self.frozen_actions_enabled = false;
+        terminal.unwrap_or(TouchpadOutput::Idle)
+    }
+
+    /// Terminate an open scroll stream, if any. Scrolling travelled past the
+    /// tap limits, so a scrolled stroke can never also resolve a tap and the
+    /// two outcomes never compete.
+    fn close_scroll_stream(&mut self, phase: SmoothScrollPhase) -> Option<TouchpadOutput> {
+        self.scroll_streaming.then(|| {
+            self.scroll_streaming = false;
+            TouchpadOutput::Scroll {
+                dx_um: 0,
+                dy_um: 0,
+                phase,
+            }
+        })
     }
 
     fn action(&self, trigger: ButtonId) -> Option<(ButtonId, Action)> {
@@ -156,8 +214,8 @@ impl SessionTouchpads {
         self.0.entry(session.clone()).or_default()
     }
 
-    fn cancel_session(&mut self, session: &HidppSessionId) {
-        self.0.remove(session);
+    fn cancel_session(&mut self, session: &HidppSessionId) -> Option<TouchpadOutput> {
+        self.0.remove(session).map(|mut runtime| runtime.cancel())
     }
 }
 
@@ -186,7 +244,9 @@ impl InputDispatcher {
         self.outputs.cancel_session(session);
         self.wheels.cancel_session(session);
         self.gesture_presses.cancel_session(session);
-        self.touchpads.cancel_session(session);
+        if let Some(outcome) = self.touchpads.cancel_session(session) {
+            Self::route_touchpad_output(&self.outputs, session.device_key(), outcome);
+        }
     }
 
     /// Route one captured input from `session` to its bound action or
@@ -267,27 +327,23 @@ impl InputDispatcher {
                 }
             }
             CapturedInput::TouchpadFrame(frame) => {
-                Self::dispatch_touchpad_frame(
-                    &mut self.touchpads,
-                    &self.outputs,
-                    session,
-                    key,
+                let outcome = self.touchpads.for_session(session).update(
                     &frame,
                     &plan.touchpad_bindings,
                     touchpad_actions_enabled,
                 );
+                Self::route_touchpad_output(&self.outputs, key, outcome);
             }
             CapturedInput::TouchpadEnd => {
-                Self::end_touchpad_stroke(
-                    &mut self.touchpads,
-                    &self.outputs,
-                    session,
-                    key,
-                    touchpad_actions_enabled,
-                );
+                let outcome = self
+                    .touchpads
+                    .for_session(session)
+                    .end(touchpad_actions_enabled);
+                Self::route_touchpad_output(&self.outputs, key, outcome);
             }
             CapturedInput::TouchpadCancel => {
-                self.touchpads.for_session(session).cancel();
+                let outcome = self.touchpads.for_session(session).cancel();
+                Self::route_touchpad_output(&self.outputs, key, outcome);
             }
             CapturedInput::TouchpadDroppedFrames(_) => {}
         }
@@ -339,42 +395,19 @@ impl InputDispatcher {
             .dispatch_hidpp_button_pulse(session, button, binding);
     }
 
-    fn dispatch_touchpad_frame(
-        touchpads: &mut SessionTouchpads,
-        outputs: &GestureOutputs,
-        session: &HidppSessionId,
-        key: &str,
-        frame: &TouchFrame,
-        bindings: &BTreeMap<ButtonId, Action>,
-        actions_enabled: bool,
-    ) {
-        let action = touchpads
-            .for_session(session)
-            .update(frame, bindings, actions_enabled);
-        Self::dispatch_touchpad_action(outputs, key, action);
-    }
-
-    fn end_touchpad_stroke(
-        touchpads: &mut SessionTouchpads,
-        outputs: &GestureOutputs,
-        session: &HidppSessionId,
-        key: &str,
-        actions_enabled: bool,
-    ) {
-        let action = touchpads.for_session(session).end(actions_enabled);
-        Self::dispatch_touchpad_action(outputs, key, action);
-    }
-
-    fn dispatch_touchpad_action(
-        outputs: &GestureOutputs,
-        key: &str,
-        action: Option<(ButtonId, Action)>,
-    ) {
-        let Some((trigger, action)) = action else {
-            return;
-        };
-        debug!(key, %trigger, action = %action.label(), "touchpad gesture → action");
-        outputs.actions.dispatch(&action, Some(key));
+    fn route_touchpad_output(outputs: &GestureOutputs, key: &str, outcome: TouchpadOutput) {
+        match outcome {
+            TouchpadOutput::Idle => {}
+            TouchpadOutput::Action { trigger, action } => {
+                debug!(key, %trigger, action = %action.label(), "touchpad gesture → action");
+                outputs.actions.dispatch(&action, Some(key));
+            }
+            TouchpadOutput::Scroll {
+                dx_um,
+                dy_um,
+                phase,
+            } => super::post_touchpad_scroll(dx_um, dy_um, phase),
+        }
     }
 }
 
