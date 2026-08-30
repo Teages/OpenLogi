@@ -86,8 +86,15 @@ impl GestureOutputs {
 /// delta. The capture session owns the pad's raw stream, which switches its
 /// firmware scroll translation off — OpenLogi restores the scrolling itself,
 /// the contract Options+ keeps on the same hardware.
-fn post_touchpad_scroll(tuning: TouchpadScrollTuning, dx: i64, dy: i64, phase: SmoothScrollPhase) {
-    openlogi_inject::post_touchpad_scroll(tuning.content_delta(dx, dy), Some(phase));
+///
+/// Every frame is wheel-class — no scroll phase, matching what the pad's
+/// firmware emits natively. Phased frames carry drag semantics: apps
+/// rubber-band them at document boundaries and keep the page stretched while
+/// later deltas feed the overscroll. Wheel-class deltas clamp, exactly the
+/// native feel this device has without capture.
+fn post_touchpad_scroll(tuning: TouchpadScrollTuning, dx: i64, dy: i64, _phase: SmoothScrollPhase) {
+    // Wheel-class on purpose — see the doc comment above.
+    openlogi_inject::post_touchpad_scroll(tuning.content_delta(dx, dy), None);
 }
 
 /// Effective tuning of one device's synthesized two-finger scrolling.
