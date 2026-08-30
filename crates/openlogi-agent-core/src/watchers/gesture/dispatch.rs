@@ -473,8 +473,11 @@ impl InputDispatcher {
     }
 
     /// End one touchpad stroke: route the terminal (zero-delta phase event,
-    /// or a tap that survived the scroll travel limits) and, when the
-    /// lift-off was fast enough, hand the exit velocity to a momentum tail.
+    /// or a tap that survived the scroll travel limits). A fast-enough
+    /// lift-off hands the exit velocity to a momentum tail instead — the
+    /// tail continues the stream with `Changed` frames and owns its own
+    /// terminal, so the dispatcher must not post one and break phase
+    /// monotonicity.
     fn end_touchpad_stroke(
         &mut self,
         session: &HidppSessionId,
@@ -483,17 +486,24 @@ impl InputDispatcher {
         actions_enabled: bool,
     ) {
         let tuning = TouchpadScrollTuning::from_plan(plan);
-        let outcome = self.touchpads.for_session(session).end(actions_enabled);
-        let exit_velocity = match &outcome {
+        match self.touchpads.for_session(session).end(actions_enabled) {
             TouchpadOutput::ScrollEnd {
-                exit_velocity_um_per_s,
-                ..
-            } => *exit_velocity_um_per_s,
-            _ => None,
-        };
-        Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
-        if let Some(exit_velocity) = exit_velocity {
-            self.momentum = TouchpadMomentum::start(tuning, exit_velocity);
+                phase: SmoothScrollPhase::Ended,
+                exit_velocity_um_per_s: Some(exit_velocity),
+            } => match TouchpadMomentum::start(tuning, exit_velocity) {
+                Some(momentum) => self.momentum = Some(momentum),
+                // Too slow to glide: close the stream with the terminal.
+                None => Self::route_touchpad_output(
+                    &self.outputs,
+                    tuning,
+                    key,
+                    TouchpadOutput::ScrollEnd {
+                        phase: SmoothScrollPhase::Ended,
+                        exit_velocity_um_per_s: Some(exit_velocity),
+                    },
+                ),
+            },
+            outcome => Self::route_touchpad_output(&self.outputs, tuning, key, outcome),
         }
     }
 

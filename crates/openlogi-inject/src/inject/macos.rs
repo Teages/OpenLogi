@@ -16,8 +16,8 @@ use openlogi_core::binding::{
 use openlogi_core::scroll::ScrollDelta;
 
 use super::{
-    HeldKey, HeldModifiers, KeyPhase, MomentumScrollPhase, PIXELS_PER_WHEEL_TICK, QuantizedScroll,
-    ScrollQuantizer, SmoothScrollPhase,
+    HeldKey, HeldModifiers, KeyPhase, PIXELS_PER_WHEEL_TICK, QuantizedScroll, ScrollQuantizer,
+    SmoothScrollPhase,
 };
 
 static LINE_SCROLL_QUANTIZER: LazyLock<Mutex<ScrollQuantizer>> =
@@ -667,7 +667,7 @@ pub(super) fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     };
     let delta = quantizer.quantize(delta, units_per_input);
     drop(quantizer);
-    post_continuous_scroll(delta, scroll_phase_value(phase), 0, CGEventTapLocation::HID);
+    post_continuous_scroll(delta, phase);
 }
 
 /// Synthesise one frame of a touchpad scroll after honouring the user's
@@ -680,40 +680,10 @@ pub(super) fn post_touchpad_scroll(delta: ScrollDelta, phase: SmoothScrollPhase)
     };
     let delta = quantizer.quantize(delta, 1.0);
     drop(quantizer);
-    post_continuous_scroll(delta, scroll_phase_value(phase), 0, CGEventTapLocation::HID);
+    post_continuous_scroll(delta, phase);
 }
 
-/// Synthesise one frame of touchpad scroll *momentum* — the decaying tail a
-/// trackpad shows after lift (see [`super::post_touchpad_momentum_scroll`]).
-/// The gesture's own scroll-phase stream must already be terminated; momentum
-/// is a separate phase machine the system tracks on the momentum field.
-pub(super) fn post_touchpad_momentum_scroll(delta: ScrollDelta, phase: MomentumScrollPhase) {
-    let delta = orient_by_scroll_preference(delta);
-    let Ok(mut quantizer) = TOUCHPAD_SCROLL_QUANTIZER.lock() else {
-        tracing::warn!("macOS touchpad scroll quantizer mutex poisoned");
-        return;
-    };
-    let delta = quantizer.quantize(delta, 1.0);
-    drop(quantizer);
-    // Momentum rides the session tap: the HID layer re-interprets
-    // device-class scroll input and drops the momentum phase, while the
-    // session level hands the event to apps as-is (the posting level Mac
-    // Mouse Fix ships its synthesized momentum on). Our hook taps HID, so
-    // these never feed back.
-    post_continuous_scroll(
-        delta,
-        0,
-        momentum_phase_value(phase),
-        CGEventTapLocation::Session,
-    );
-}
-
-fn post_continuous_scroll(
-    delta: QuantizedScroll,
-    scroll_phase: i64,
-    momentum_phase: i64,
-    tap: CGEventTapLocation,
-) {
+fn post_continuous_scroll(delta: QuantizedScroll, phase: SmoothScrollPhase) {
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         tracing::warn!("CGEventSource::new failed for smooth scroll");
         return;
@@ -724,10 +694,10 @@ fn post_continuous_scroll(
         return;
     };
     set_continuous_scroll_fields(&ev, delta);
-    ev.set_integer_value_field(SCROLL_PHASE, scroll_phase);
-    ev.set_integer_value_field(MOMENTUM_PHASE, momentum_phase);
+    ev.set_integer_value_field(SCROLL_PHASE, scroll_phase_value(phase));
+    ev.set_integer_value_field(MOMENTUM_PHASE, 0);
     tag_synthetic(&ev);
-    ev.post(tap);
+    ev.post(CGEventTapLocation::HID);
 }
 
 /// How long a natural-scrolling preference read stays valid: long enough that
@@ -773,16 +743,6 @@ fn orient_by_scroll_preference(delta: ScrollDelta) -> ScrollDelta {
         delta
     } else {
         ScrollDelta::pixels(-delta.x(), -delta.y())
-    }
-}
-
-/// `CGMomentumScrollPhase`: none 0, begin 1, continue 2, end 3. Momentum has
-/// no cancelled phase — a stopped tail always ends with `end`.
-const fn momentum_phase_value(phase: MomentumScrollPhase) -> i64 {
-    match phase {
-        MomentumScrollPhase::Began => 1,
-        MomentumScrollPhase::Changed => 2,
-        MomentumScrollPhase::Ended => 3,
     }
 }
 
