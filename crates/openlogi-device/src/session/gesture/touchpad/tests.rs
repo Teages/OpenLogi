@@ -13,6 +13,7 @@ use crate::channel::scripted::{ScriptedRawHidChannel, scripted_channel};
 const TOUCHPAD_INDEX: u8 = 0x04;
 static RAW_MODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static RAW_MODE: AtomicU8 = AtomicU8::new(0);
+static INFO_MAPPING_VERSION: AtomicU8 = AtomicU8::new(0);
 static RAW_MODE_WRITE_RESULT: AtomicU8 = AtomicU8::new(u8::MAX);
 
 #[derive(Default)]
@@ -40,6 +41,23 @@ fn raw_mode_responder(request: &[u8]) -> Option<Vec<u8>> {
     }
     let mut payload = [0u8; 3];
     match (request[2], request[3] >> 4) {
+        // `get_touchpad_info` (fn 0): a 16-byte payload whose byte 12 is the
+        // raw-report mapping version, answered with a long frame.
+        (TOUCHPAD_INDEX, 0x00) => {
+            let mut info = [0u8; 16];
+            info[0..2].copy_from_slice(&2_775_u16.to_be_bytes());
+            info[2..4].copy_from_slice(&1_786_u16.to_be_bytes());
+            info[6] = 10;
+            info[7] = 4;
+            info[8] = Origin::UpperLeft as u8;
+            info[12] = INFO_MAPPING_VERSION.load(Ordering::Relaxed);
+            info[13..15].copy_from_slice(&600_u16.to_be_bytes());
+            let mut response = vec![0u8; 20];
+            response[0] = 0x11;
+            response[1..4].copy_from_slice(&request[1..4]);
+            response[4..].copy_from_slice(&info);
+            return Some(response);
+        }
         (TOUCHPAD_INDEX, 0x01) => payload[0] = RAW_MODE.load(Ordering::Relaxed),
         (TOUCHPAD_INDEX, 0x02) => {
             let forced = RAW_MODE_WRITE_RESULT.load(Ordering::Relaxed);
@@ -701,4 +719,27 @@ fn abnormal_device_timestamp_gap_ends_before_the_next_frame() {
         events,
         vec![TouchpadStreamEvent::End, TouchpadStreamEvent::Frame(next)]
     );
+}
+
+#[tokio::test]
+async fn geometry_accepts_mapping_versions_0_and_1_and_rejects_others() {
+    // Regression pin for the Casa Touch: the pad this feature targets
+    // reports mapping version 0 while following the standard DualXY layout.
+    let info = |feature: TouchpadRawXyFeature| async move {
+        feature
+            .get_touchpad_info()
+            .await
+            .expect("info payload parses")
+    };
+
+    let _guard = RAW_MODE_TEST_LOCK.lock().await;
+    INFO_MAPPING_VERSION.store(0, Ordering::Relaxed);
+    Geometry::new(info(raw_mode_feature(0).await).await).expect("mapping version 0 is accepted");
+    INFO_MAPPING_VERSION.store(1, Ordering::Relaxed);
+    Geometry::new(info(raw_mode_feature(1).await).await).expect("mapping version 1 is accepted");
+    INFO_MAPPING_VERSION.store(2, Ordering::Relaxed);
+    let Err(error) = Geometry::new(info(raw_mode_feature(2).await).await) else {
+        panic!("other mapping versions must be rejected");
+    };
+    assert!(matches!(error, TouchpadStreamError::UnsupportedMapping(2)));
 }

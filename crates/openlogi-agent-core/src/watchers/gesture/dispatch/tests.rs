@@ -529,3 +529,44 @@ fn four_finger_swipes_stream_like_three_finger_ones() {
         }
     );
 }
+
+#[test]
+fn begin_failure_falls_back_to_discrete_action() {
+    let trigger = ButtonId::TouchpadThreeFingerSwipeRight;
+    let bindings = BTreeMap::from([(trigger, Action::NextDesktop)]);
+    let mut runtime = TouchpadRuntime::default();
+    runtime.update(&translated_frame(0, 3, 0, 0), &bindings, true, true);
+    runtime.update(
+        &translated_frame(60_000, 3, 15_000, 0),
+        &bindings,
+        true,
+        true,
+    );
+    runtime.update(
+        &translated_frame(90_000, 3, 25_000, 0),
+        &bindings,
+        true,
+        true,
+    );
+
+    // The Began post failed: the stream closes and commit's suppressed
+    // action is returned for dispatch, per the API fallback contract.
+    assert_eq!(runtime.begin_failed(), Some((trigger, Action::NextDesktop)));
+
+    // Closed: later frames and the stroke end post nothing.
+    let outcome = runtime.update(
+        &translated_frame(120_000, 3, 30_000, 0),
+        &bindings,
+        true,
+        true,
+    );
+    assert_eq!(outcome.stream, SwipeOutput::Idle);
+    let outcome = runtime.end(true);
+    assert_eq!(outcome.stream, SwipeOutput::Idle);
+}
+
+#[test]
+fn begin_failed_without_a_stream_returns_none() {
+    let mut runtime = TouchpadRuntime::default();
+    assert_eq!(runtime.begin_failed(), None);
+}

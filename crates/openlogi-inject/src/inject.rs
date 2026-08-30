@@ -481,26 +481,36 @@ pub fn dock_swipe_supported() -> bool {
 
 /// Stream one DockSwipe event toward the WindowServer.
 ///
+/// `owner` scopes the single system-wide gesture stream to one caller
+/// session: a `Began` from a new owner supersedes the previous owner's
+/// animation, and the previous owner's later frames are rejected.
+///
 /// `delta` is the progress increment of a [`DockSwipePhase::Changed`] frame
 /// (1.0 ≈ one screen width); on [`DockSwipePhase::Began`] it seeds the
 /// accumulated progress with the opening frame's travel — the vertical
 /// consumer ignores a zero-progress Began, so the caller posts Began only
 /// once real travel exists. Exit velocity (last delta × 100) and the release
 /// sign rule live behind this boundary, mirroring Mac Mouse Fix's
-/// `TouchSimulator`. Returns `false` when the platform cannot stream or the
-/// event was dropped; a `false` on [`DockSwipePhase::Began`] means the caller
-/// should fall back to the bound action's discrete dispatch.
+/// `TouchSimulator`. Returns `false` when the platform cannot stream, the
+/// event was dropped, or `owner` no longer owns the stream; a `false` on
+/// [`DockSwipePhase::Began`] means the caller should fall back to the bound
+/// action's discrete dispatch.
 #[expect(
     clippy::must_use_candidate,
     reason = "streaming frames are fire-and-forget; only a failed begin changes dispatch behavior"
 )]
-pub fn post_dock_swipe(motion: DockSwipeMotion, phase: DockSwipePhase, delta: f64) -> bool {
+pub fn post_dock_swipe(
+    owner: u64,
+    motion: DockSwipeMotion,
+    phase: DockSwipePhase,
+    delta: f64,
+) -> bool {
     cfg_select! {
         target_os = "macos" => {
-            macos::dockswipe::post(motion, phase, delta)
+            macos::dockswipe::post(owner, motion, phase, delta)
         }
         _ => {
-            let _ = (motion, phase, delta);
+            let _ = (owner, motion, phase, delta);
             false
         }
     }
@@ -600,13 +610,20 @@ mod tests {
             "requires macOS 27+ with SkyLight SLEventSetIOHIDEvent and the HIDEvent class"
         );
         for i in 0..=16_u32 {
+            // Production shape: Began carries the first travel share, Changed
+            // streams the rest, End posts no delta.
             let (phase, delta) = match i {
-                0 => (DockSwipePhase::Began, 0.0),
-                16 => (DockSwipePhase::End, 0.65 / 16.0),
+                0 => (DockSwipePhase::Began, 0.65 / 16.0),
+                16 => (DockSwipePhase::End, 0.0),
                 _ => (DockSwipePhase::Changed, 0.65 / 16.0),
             };
             assert!(
-                post_dock_swipe(DockSwipeMotion::Horizontal, phase, delta),
+                post_dock_swipe(
+                    0x00_00_00_00_00_00_00_01,
+                    DockSwipeMotion::Horizontal,
+                    phase,
+                    delta,
+                ),
                 "frame {i} could not be posted"
             );
             std::thread::sleep(Duration::from_millis(16));

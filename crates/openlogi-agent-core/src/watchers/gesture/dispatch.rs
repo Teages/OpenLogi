@@ -126,10 +126,9 @@ impl TouchpadRuntime {
                         // The ended DockSwipe event itself commits the system
                         // action, so the discrete dispatch is suppressed. The
                         // stream opens on the first frame with actual travel,
-                        // not at commit (the vertical consumer ignores a
-                        // zero-progress Began).
+                        // not at commit.
                         (true, Some(motion)) => {
-                            self.stream = Some(ActiveSwipe::new(frame, motion));
+                            self.stream = Some(ActiveSwipe::new(frame, motion, (trigger, action)));
                         }
                         (_, _) => outcome.action = Some((trigger, action)),
                     }
@@ -153,16 +152,10 @@ impl TouchpadRuntime {
             .end()
             .filter(|_| self.frozen_actions_enabled && actions_enabled)
             .and_then(|trigger| self.action(trigger));
-        let stream = self.stream.take().map_or(SwipeOutput::Idle, |swipe| {
-            if swipe.opened {
-                SwipeOutput::Finish {
-                    motion: swipe.motion,
-                    end: SwipeEnd::AtRelease,
-                }
-            } else {
-                SwipeOutput::Idle
-            }
-        });
+        let stream = self
+            .stream
+            .take()
+            .map_or(SwipeOutput::Idle, |swipe| swipe.finish(SwipeEnd::AtRelease));
         self.frozen_bindings = None;
         self.frozen_actions_enabled = false;
         TouchpadOutcome { action, stream }
@@ -183,16 +176,16 @@ impl TouchpadRuntime {
     /// A stream that never opened never posted anything, so it ends silently.
     fn terminate(&mut self) -> SwipeOutput {
         self.cancel();
-        self.stream.take().map_or(SwipeOutput::Idle, |swipe| {
-            if swipe.opened {
-                SwipeOutput::Finish {
-                    motion: swipe.motion,
-                    end: SwipeEnd::Cancelled,
-                }
-            } else {
-                SwipeOutput::Idle
-            }
-        })
+        self.stream
+            .take()
+            .map_or(SwipeOutput::Idle, |swipe| swipe.finish(SwipeEnd::Cancelled))
+    }
+
+    /// The Began post failed: per the API contract the stream closes without
+    /// posting anything, and the discrete action that commit suppressed is
+    /// returned for dispatch.
+    fn begin_failed(&mut self) -> Option<(ButtonId, Action)> {
+        self.stream.take().and_then(|swipe| swipe.fallback)
     }
 
     fn action(&self, trigger: ButtonId) -> Option<(ButtonId, Action)> {
@@ -217,8 +210,8 @@ enum SwipeOutput {
     #[default]
     Idle,
     /// Begin the animation for `motion`; `progress` seeds the accumulated
-    /// progress with the opening frame's travel (a zero-progress Began is
-    /// ignored by the vertical consumer), and later frames stream increments.
+    /// progress with the opening frame's travel, and later frames stream
+    /// increments.
     Begin {
         motion: DockSwipeMotion,
         progress: f64,
@@ -247,17 +240,34 @@ enum SwipeEnd {
 struct ActiveSwipe {
     motion: DockSwipeMotion,
     opened: bool,
+    /// The discrete action suppressed at commit, dispatched if the Began
+    /// post fails.
+    fallback: Option<(ButtonId, Action)>,
     contact_ids: Box<[u8]>,
     centroid_um: (i64, i64),
 }
 
 impl ActiveSwipe {
-    fn new(frame: &TouchFrame, motion: DockSwipeMotion) -> Self {
+    fn new(frame: &TouchFrame, motion: DockSwipeMotion, fallback: (ButtonId, Action)) -> Self {
         Self {
             motion,
             opened: false,
+            fallback: Some(fallback),
             contact_ids: frame.contacts().iter().map(|c| c.id).collect(),
             centroid_um: frame_centroid(frame.contacts()),
+        }
+    }
+
+    /// End-of-stream command: an unopened stream posted nothing and ends
+    /// silently.
+    fn finish(self, end: SwipeEnd) -> SwipeOutput {
+        if self.opened {
+            SwipeOutput::Finish {
+                motion: self.motion,
+                end,
+            }
+        } else {
+            SwipeOutput::Idle
         }
     }
 
@@ -280,9 +290,8 @@ impl ActiveSwipe {
                 centroid.1 - self.centroid_um.1,
             );
             // Progress follows the physical axes: horizontal takes dx as-is,
-            // vertical negates dy (y grows downward) so an upward pull —
-            // Mission Control — streams positive progress, matching the
-            // working vertical events captured from Mac Mouse Fix.
+            // vertical negates dy (y grows downward) so an upward Mission
+            // Control pull streams positive progress.
             let raw = match self.motion {
                 DockSwipeMotion::Horizontal => dx,
                 DockSwipeMotion::Vertical => -dy,
@@ -327,12 +336,9 @@ const VERTICAL_PAD_TRAVEL_UM: f64 = 75_600.0;
 /// binding names.
 ///
 /// Progress signs are deliberately **not** per trigger direction: they follow
-/// the physical axis (fingers right/down stream positive, left/up negative),
-/// so mid-stroke reversals render physically. Hardware-verified on the Casa
-/// Touch (2026-08-30): the system renders positive horizontal progress as
-/// rightward content travel, so fingers-right commits toward the previous
-/// Space — the natural-scrolling feel — while a per-trigger sign made the
-/// left swipes render backwards.
+/// the physical axis (fingers right/up stream positive, left/down negative),
+/// so mid-stroke reversals render physically — the natural-scrolling feel,
+/// hardware-verified against the working Mac Mouse Fix implementation.
 fn native_stream_plan(trigger: ButtonId, action: &Action) -> Option<DockSwipeMotion> {
     let motion = match trigger {
         ButtonId::TouchpadThreeFingerSwipeRight
@@ -357,6 +363,15 @@ fn native_stream_plan(trigger: ButtonId, action: &Action) -> Option<DockSwipeMot
     action_fits.then_some(motion)
 }
 
+/// Stable per-session DockSwipe stream owner, so the injector can reject
+/// another touchpad session's frames after ownership changes hands.
+fn stream_owner(session: &HidppSessionId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn frame_centroid(contacts: &[TouchContact]) -> (i64, i64) {
     let count = i64::try_from(contacts.len()).unwrap_or(1);
     let sum = contacts.iter().fold((0_i64, 0_i64), |(sx, sy), contact| {
@@ -371,6 +386,14 @@ struct SessionTouchpads(HashMap<HidppSessionId, TouchpadRuntime>);
 impl SessionTouchpads {
     fn for_session(&mut self, session: &HidppSessionId) -> &mut TouchpadRuntime {
         self.0.entry(session.clone()).or_default()
+    }
+
+    /// The Began post failed for `session`'s stream: close it and surface the
+    /// suppressed discrete action.
+    fn begin_failed(&mut self, session: &HidppSessionId) -> Option<(ButtonId, Action)> {
+        self.0
+            .get_mut(session)
+            .and_then(TouchpadRuntime::begin_failed)
     }
 
     /// Drop one session's runtime, returning the animation command its
@@ -408,7 +431,7 @@ impl InputDispatcher {
         self.outputs.cancel_session(session);
         self.wheels.cancel_session(session);
         self.gesture_presses.cancel_session(session);
-        Self::execute_touchpad_stream(&terminal, session.device_key());
+        Self::execute_touchpad_stream(stream_owner(session), &terminal, session.device_key());
     }
 
     /// Route one captured input from `session` to its bound action or
@@ -496,14 +519,26 @@ impl InputDispatcher {
                     touchpad_actions_enabled,
                     native_streaming,
                 );
-                Self::execute_touchpad_outcome(&self.outputs, &outcome, key);
+                Self::execute_touchpad_outcome(
+                    &self.outputs,
+                    &mut self.touchpads,
+                    session,
+                    &outcome,
+                    key,
+                );
             }
             CapturedInput::TouchpadEnd => {
                 let outcome = self
                     .touchpads
                     .for_session(session)
                     .end(touchpad_actions_enabled);
-                Self::execute_touchpad_outcome(&self.outputs, &outcome, key);
+                Self::execute_touchpad_outcome(
+                    &self.outputs,
+                    &mut self.touchpads,
+                    session,
+                    &outcome,
+                    key,
+                );
             }
             CapturedInput::TouchpadCancel => {
                 self.touchpads.for_session(session).cancel();
@@ -558,8 +593,35 @@ impl InputDispatcher {
             .dispatch_hidpp_button_pulse(session, button, binding);
     }
 
-    fn execute_touchpad_outcome(outputs: &GestureOutputs, outcome: &TouchpadOutcome, key: &str) {
-        Self::execute_touchpad_stream(&outcome.stream, key);
+    fn execute_touchpad_outcome(
+        outputs: &GestureOutputs,
+        touchpads: &mut SessionTouchpads,
+        session: &HidppSessionId,
+        outcome: &TouchpadOutcome,
+        key: &str,
+    ) {
+        let owner = stream_owner(session);
+        match &outcome.stream {
+            SwipeOutput::Begin { motion, progress } => {
+                if openlogi_inject::post_dock_swipe(
+                    owner,
+                    *motion,
+                    DockSwipePhase::Began,
+                    *progress,
+                ) {
+                    debug!(key, ?motion, "touchpad swipe → native DockSwipe animation");
+                } else {
+                    // Per the API contract: close the stream and fall back to
+                    // the discrete action that commit suppressed.
+                    tracing::warn!(key, ?motion, "native dock swipe failed to begin");
+                    if let Some((trigger, action)) = touchpads.begin_failed(session) {
+                        debug!(key, %trigger, action = %action.label(), "touchpad swipe → discrete fallback");
+                        outputs.actions.dispatch(&action, Some(key));
+                    }
+                }
+            }
+            stream => Self::execute_touchpad_stream(owner, stream, key),
+        }
         let Some((trigger, action)) = outcome.action.as_ref() else {
             return;
         };
@@ -567,34 +629,28 @@ impl InputDispatcher {
         outputs.actions.dispatch(action, Some(key));
     }
 
-    /// Forward one native-animation command to the injector. Only a failed
-    /// begin needs logging beyond the injector's own: the runtime never
-    /// opens a stream when `dock_swipe_supported()` is false.
-    fn execute_touchpad_stream(stream: &SwipeOutput, key: &str) {
+    /// Forward one native-animation command to the injector. The owner id
+    /// scopes the stream to this capture session, so a second touchpad's
+    /// gestures can never advance or finish another session's animation.
+    fn execute_touchpad_stream(owner: u64, stream: &SwipeOutput, key: &str) {
         match *stream {
             SwipeOutput::Idle => {}
-            SwipeOutput::Begin { motion, progress } => {
-                if openlogi_inject::post_dock_swipe(motion, DockSwipePhase::Began, progress) {
-                    debug!(key, ?motion, "touchpad swipe → native DockSwipe animation");
-                } else {
-                    tracing::warn!(key, ?motion, "native dock swipe failed to begin");
-                }
-            }
+            SwipeOutput::Begin { .. } => unreachable!("handled by execute_touchpad_outcome"),
             SwipeOutput::Advance { motion, delta } => {
-                openlogi_inject::post_dock_swipe(motion, DockSwipePhase::Changed, delta);
+                openlogi_inject::post_dock_swipe(owner, motion, DockSwipePhase::Changed, delta);
             }
             SwipeOutput::Finish {
                 motion,
                 end: SwipeEnd::AtRelease,
             } => {
-                openlogi_inject::post_dock_swipe(motion, DockSwipePhase::End, 0.0);
+                openlogi_inject::post_dock_swipe(owner, motion, DockSwipePhase::End, 0.0);
             }
             SwipeOutput::Finish {
                 motion,
                 end: SwipeEnd::Cancelled,
             } => {
                 debug!(key, ?motion, "touchpad swipe animation cancelled");
-                openlogi_inject::post_dock_swipe(motion, DockSwipePhase::Cancel, 0.0);
+                openlogi_inject::post_dock_swipe(owner, motion, DockSwipePhase::Cancel, 0.0);
             }
         }
     }

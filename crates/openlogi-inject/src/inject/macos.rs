@@ -1500,13 +1500,15 @@ pub(super) mod dockswipe {
     const END_RESEND_DELAYS: [Duration; 2] =
         [Duration::from_millis(200), Duration::from_millis(500)];
 
-    /// Accumulated progress and last delta of the running gesture, plus a
-    /// generation counter that invalidates pending end-event resends when a
-    /// new gesture begins. One stream at a time: the touchpad dispatch layer
-    /// runs at most one swipe per device and the DockSwipe system state is
-    /// global anyway.
+    /// Accumulated progress and last delta of the running gesture, its owner
+    /// (the capture session that opened it), and a generation counter that
+    /// invalidates pending end-event resends when a new gesture begins. One
+    /// stream at a time — the DockSwipe system state is global — so a Began
+    /// from a new owner supersedes the previous animation and the previous
+    /// owner's later frames are rejected.
     static STREAM: LazyLock<Mutex<Stream>> = LazyLock::new(|| {
         Mutex::new(Stream {
+            owner: 0,
             progress: 0.0,
             last_delta: 0.0,
             generation: 0,
@@ -1514,6 +1516,7 @@ pub(super) mod dockswipe {
     });
 
     struct Stream {
+        owner: u64,
         progress: f64,
         last_delta: f64,
         generation: u64,
@@ -1537,11 +1540,12 @@ pub(super) mod dockswipe {
     }
 
     pub(in crate::inject) fn post(
+        owner: u64,
         motion: DockSwipeMotion,
         phase: DockSwipePhase,
         delta: f64,
     ) -> bool {
-        let Some(event_plan) = plan_event(phase, delta) else {
+        let Some(event_plan) = plan_event(owner, phase, delta) else {
             // Zero-delta continuation: Mac Mouse Fix skips those too.
             return false;
         };
@@ -1569,17 +1573,22 @@ pub(super) mod dockswipe {
     }
 
     /// Apply `phase`/`delta` to the stream state and derive the event to post.
-    fn plan_event(phase: DockSwipePhase, delta: f64) -> Option<EventPlan> {
+    fn plan_event(owner: u64, phase: DockSwipePhase, delta: f64) -> Option<EventPlan> {
         let Ok(mut stream) = STREAM.lock() else {
             tracing::warn!("dock swipe stream mutex poisoned");
             return None;
         };
+        if phase != DockSwipePhase::Began && stream.owner != owner {
+            // A superseded session's frames must not touch the new owner's
+            // animation.
+            return None;
+        }
         match phase {
             DockSwipePhase::Began => {
+                stream.owner = owner;
                 stream.generation = stream.generation.wrapping_add(1);
-                // Mac Mouse Fix's Began carries the stroke's first delta, and
-                // the vertical consumer ignores a zero-progress Began — so
-                // the opening frame's travel seeds the accumulator.
+                // Mac Mouse Fix's Began carries the stroke's first delta,
+                // which seeds the accumulator.
                 stream.progress = delta;
                 stream.last_delta = delta;
                 Some(EventPlan {
@@ -1679,10 +1688,6 @@ pub(super) mod dockswipe {
         carrier_timestamp: u64,
     ) -> Option<Retained<AnyObject>> {
         let class = AnyClass::get(c"HIDEvent")?;
-        // Ground truth captured from Mac Mouse Fix's working gestures (see
-        // DOCKSWIPE-TEST-NOTES): the HIDEvent timestamp is the carrier
-        // CGEvent's own stamp, passed through untouched.
-        let timestamp = carrier_timestamp;
         // SAFETY: HIDEvent responds to `alloc` (+1 result). The class is
         // opaque, so every exchange below runs on raw pointers.
         let alloc: *mut AnyObject = unsafe { msg_send![class, alloc] };
@@ -1693,37 +1698,35 @@ pub(super) mod dockswipe {
         // interface as `(uint32_t)type (uint64_t)timestamp (uint64_t)senderID`;
         // it consumes the alloc's +1 and returns +1 (or nil).
         let event: *mut AnyObject = unsafe {
-            msg_send![alloc, initWithType: HID_TYPE_DOCK_SWIPE, timestamp: timestamp, senderID: 0_u64]
+            msg_send![alloc, initWithType: HID_TYPE_DOCK_SWIPE, timestamp: carrier_timestamp, senderID: 0_u64]
         };
-        if event.is_null() {
-            return None;
-        }
+        // SAFETY: the +1 from the init above transfers into the Retained; the
+        // parent must be owned before any fallible child step, or a failure
+        // below would leak it.
+        let event: Retained<AnyObject> = unsafe { Retained::from_raw(event) }?;
         // SAFETY: `setIntegerValue:forField:` is `(NSInteger, uint32_t)` on the
         // prototype's HIDEvent interface; every selector below is verified
         // end-to-end by the prototype's payload round-trip.
         unsafe {
             let () =
-                msg_send![event, setIntegerValue: motion_id, forField: FIELD_DOCK_SWIPE_MOTION];
-            let () = msg_send![event, setIntegerValue: FLAVOR_DOCK_PRIMARY, forField: FIELD_DOCK_SWIPE_FLAVOR];
-            let () = msg_send![event, setDoubleValue: plan.progress, forField: FIELD_DOCK_SWIPE_PROGRESS];
-            let () = msg_send![event, setOptions: plan.options];
+                msg_send![&event, setIntegerValue: motion_id, forField: FIELD_DOCK_SWIPE_MOTION];
+            let () = msg_send![&event, setIntegerValue: FLAVOR_DOCK_PRIMARY, forField: FIELD_DOCK_SWIPE_FLAVOR];
+            let () = msg_send![&event, setDoubleValue: plan.progress, forField: FIELD_DOCK_SWIPE_PROGRESS];
+            let () = msg_send![&event, setOptions: plan.options];
         }
         if let Some(velocity) = plan.velocity {
             let child = velocity_event(velocity, carrier_timestamp)?;
             // SAFETY: `appendEvent:` takes an object pointer and retains it;
             // the raw pointer is live for the call's duration.
             unsafe {
-                let () = msg_send![event, appendEvent: Retained::as_ptr(&child)];
+                let () = msg_send![&event, appendEvent: Retained::as_ptr(&child)];
             }
         }
-        // SAFETY: the +1 from the init above transfers into the Retained;
-        // the nil case already returned above.
-        unsafe { Retained::from_raw(event) }
+        Some(event)
     }
 
     fn velocity_event(velocity: f64, carrier_timestamp: u64) -> Option<Retained<AnyObject>> {
         let class = AnyClass::get(c"HIDEvent")?;
-        let timestamp = carrier_timestamp;
         // SAFETY: same opaque alloc/init pair as `build_hid_event`, with the
         // Velocity event type.
         let alloc: *mut AnyObject = unsafe { msg_send![class, alloc] };
@@ -1733,7 +1736,7 @@ pub(super) mod dockswipe {
         // SAFETY: init-family selector consumes the alloc's +1 and returns
         // +1 (or nil).
         let event: *mut AnyObject = unsafe {
-            msg_send![alloc, initWithType: HID_TYPE_VELOCITY, timestamp: timestamp, senderID: 0_u64]
+            msg_send![alloc, initWithType: HID_TYPE_VELOCITY, timestamp: carrier_timestamp, senderID: 0_u64]
         };
         if event.is_null() {
             return None;
