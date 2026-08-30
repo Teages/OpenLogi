@@ -1585,14 +1585,28 @@ pub(super) mod dockswipe {
             tracing::warn!("dock swipe stream mutex poisoned");
             return false;
         };
-        let event_plan = stream.began_plan(delta);
-        let posted = post_event(motion_id, &event_plan);
-        if posted {
-            stream.commit_began(owner, event_plan.generation, delta);
+        post_began_with(&mut stream, owner, delta, &mut |plan| {
+            post_event(motion_id, plan)
+        })
+    }
+
+    /// The Began transaction: deliver the event, and commit the new owner's
+    /// state only on a successful delivery — a failed one leaves the previous
+    /// owner's gesture fully alive. Delivery is injected so tests can drive
+    /// both outcomes without posting real events.
+    fn post_began_with(
+        stream: &mut Stream,
+        owner: u64,
+        delta: f64,
+        deliver: &mut dyn FnMut(&EventPlan) -> bool,
+    ) -> bool {
+        let plan = stream.began_plan(delta);
+        if deliver(&plan) {
+            stream.commit_began(owner, &plan);
+            true
         } else {
-            tracing::warn!(?motion, "dock swipe Began could not be posted");
+            false
         }
-        posted
     }
 
     /// One ready-to-post event: options bits, accumulated progress, and the
@@ -1617,13 +1631,15 @@ pub(super) mod dockswipe {
             }
         }
 
-        /// Commit a successfully delivered Began: `owner` takes the stream over
-        /// and its Began progress seeds the accumulator.
-        fn commit_began(&mut self, owner: u64, generation: u64, delta: f64) {
+        /// Commit a successfully delivered Began: `owner` takes the stream
+        /// over and the delivered event's progress seeds the accumulator.
+        /// Taking the plan makes an owner/progress mismatch with the
+        /// delivered event unrepresentable.
+        fn commit_began(&mut self, owner: u64, plan: &EventPlan) {
             self.owner = owner;
-            self.generation = generation;
-            self.progress = delta;
-            self.last_delta = delta;
+            self.generation = plan.generation;
+            self.progress = plan.progress;
+            self.last_delta = plan.progress;
         }
 
         /// Plan a continuation frame; `None` for zero-delta frames (Mac Mouse Fix
@@ -1883,21 +1899,20 @@ pub(super) mod dockswipe {
         use super::{
             FIELD_DOCK_SWIPE_FLAVOR, FIELD_DOCK_SWIPE_MOTION, FIELD_DOCK_SWIPE_PROGRESS,
             FIELD_VELOCITY_X, PHASE_BEGAN, PHASE_CANCELLED, PHASE_ENDED, PHASE_SHIFT, Stream,
-            release_phase,
+            post_began_with, release_phase,
         };
         use crate::inject::DockSwipePhase;
 
         #[test]
         fn failed_began_delivery_leaves_the_previous_owner_intact() {
             let mut stream = Stream::default();
-            let plan = stream.began_plan(0.1);
-            stream.commit_began(1, plan.generation, 0.1);
+            assert!(post_began_with(&mut stream, 1, 0.1, &mut |_| true));
             assert!(stream.advance(1, 0.1).is_some());
 
-            // Owner 2 plans a Began whose delivery then fails: nothing is
-            // committed, so owner 1's gesture stays alive — its frames and
-            // its end still work — while owner 2's frames stay rejected.
-            let _failed_plan = stream.began_plan(0.2);
+            // Owner 2's Began delivery FAILS: nothing commits, so owner 1's
+            // gesture stays alive — its frames and its end still work — while
+            // owner 2's frames stay rejected.
+            assert!(!post_began_with(&mut stream, 2, 0.2, &mut |_| false));
             assert!(stream.advance(1, -0.05).is_some());
             assert!(stream.finish(1, DockSwipePhase::End).is_some());
             assert!(stream.advance(2, 0.2).is_none());
@@ -1905,17 +1920,15 @@ pub(super) mod dockswipe {
         }
 
         #[test]
-        fn committed_began_supersedes_the_previous_owner() {
+        fn delivered_began_commits_the_new_owner() {
             let mut stream = Stream::default();
-            let plan = stream.began_plan(0.1);
-            stream.commit_began(1, plan.generation, 0.1);
+            assert!(post_began_with(&mut stream, 2, 0.2, &mut |_| true));
 
-            // A delivered Began hands the stream over: the previous owner's
-            // frames are rejected from that point on.
-            let plan = stream.began_plan(0.2);
-            stream.commit_began(2, plan.generation, 0.2);
+            assert_eq!(stream.owner, 2);
+            assert!((stream.progress - 0.2).abs() < 1e-9);
+            assert!((stream.last_delta - 0.2).abs() < 1e-9);
+            // The previous owner (1) is rejected after the handover.
             assert!(stream.advance(1, 0.1).is_none());
-            assert!(stream.finish(1, DockSwipePhase::End).is_none());
             assert!(stream.advance(2, 0.1).is_some());
         }
 

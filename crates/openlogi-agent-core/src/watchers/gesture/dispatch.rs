@@ -185,7 +185,7 @@ impl TouchpadRuntime {
     /// posting anything, and the discrete action that commit suppressed is
     /// returned for dispatch.
     fn begin_failed(&mut self) -> Option<(ButtonId, Action)> {
-        self.stream.take().and_then(|swipe| swipe.fallback)
+        self.stream.take().map(|swipe| swipe.fallback)
     }
 
     fn action(&self, trigger: ButtonId) -> Option<(ButtonId, Action)> {
@@ -242,7 +242,7 @@ struct ActiveSwipe {
     opened: bool,
     /// The discrete action suppressed at commit, dispatched if the Began
     /// post fails.
-    fallback: Option<(ButtonId, Action)>,
+    fallback: (ButtonId, Action),
     contact_ids: Box<[u8]>,
     centroid_um: (i64, i64),
 }
@@ -252,7 +252,7 @@ impl ActiveSwipe {
         Self {
             motion,
             opened: false,
-            fallback: Some(fallback),
+            fallback,
             contact_ids: frame.contacts().iter().map(|c| c.id).collect(),
             centroid_um: frame_centroid(frame.contacts()),
         }
@@ -363,15 +363,6 @@ fn native_stream_plan(trigger: ButtonId, action: &Action) -> Option<DockSwipeMot
     action_fits.then_some(motion)
 }
 
-/// Stable per-session DockSwipe stream owner, so the injector can reject
-/// another touchpad session's frames after ownership changes hands.
-fn stream_owner(session: &HidppSessionId) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    session.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn frame_centroid(contacts: &[TouchContact]) -> (i64, i64) {
     let count = i64::try_from(contacts.len()).unwrap_or(1);
     let sum = contacts.iter().fold((0_i64, 0_i64), |(sx, sy), contact| {
@@ -431,7 +422,7 @@ impl InputDispatcher {
         self.outputs.cancel_session(session);
         self.wheels.cancel_session(session);
         self.gesture_presses.cancel_session(session);
-        Self::execute_touchpad_stream(stream_owner(session), &terminal, session.device_key());
+        Self::execute_touchpad_stream(session.epoch(), &terminal, session.device_key());
     }
 
     /// Route one captured input from `session` to its bound action or
@@ -600,7 +591,7 @@ impl InputDispatcher {
         outcome: &TouchpadOutcome,
         key: &str,
     ) {
-        let owner = stream_owner(session);
+        let owner = session.epoch();
         match &outcome.stream {
             SwipeOutput::Begin { motion, progress } => {
                 if openlogi_inject::post_dock_swipe(
