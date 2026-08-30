@@ -3,17 +3,10 @@
     reason = "the SkyLight HIDEvent bridge and the private HIDEvent class are only reachable \
               via dlopen/dlsym FFI and ObjC runtime lookup"
 )]
-//! Live DockSwipe streaming for macOS 27+.
-//!
-//! macOS 27 stopped reading the pre-27 CGEvent dock-swipe fields and reads the
-//! event's attached IOHIDEvent instead. Building a `kIOHIDEventTypeDockSwipe`
-//! HIDEvent, attaching it to a type-30 CGEvent via SkyLight's
-//! `SLEventSetIOHIDEvent`, and posting to the session tap drives the native
-//! finger-following Space-switch animation — no private entitlement, only the
-//! Accessibility grant the agent already holds. Constants and semantics
-//! follow Mac Mouse Fix's macOS 27 dock-swipe path (`TouchSimulator.m`,
-//! noah-nuebling/mac-mouse-fix#1936); horizontal swipes are end-to-end
-//! hardware-confirmed, vertical ones were confirmed in the same session.
+//! Live DockSwipe streaming for macOS 27+, which reads a DockSwipe IOHIDEvent
+//! attached to the CGEvent via SkyLight's `SLEventSetIOHIDEvent` rather than
+//! the pre-27 CGEvent fields. Constants follow Mac Mouse Fix #1936; verified
+//! end-to-end on real hardware.
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -25,10 +18,8 @@ use objc2_foundation::NSProcessInfo;
 
 use crate::inject::{DockSwipeMotion, DockSwipePhase};
 
-// IOHIDEventTypes.h: kIOHIDEventTypeVelocity = 9, kIOHIDEventTypeDockSwipe
-// = 23. A field id is (type << 16) | index; DockSwipe carries Motion=1,
-// Progress=2, Flavor=5; Velocity carries X=0, Y=1, Z=2. The gesture phase
-// rides in the options bits 24–31.
+// IOHIDEventTypes.h: Velocity = 9, DockSwipe = 23; a field id is
+// (type << 16) | index, and the phase rides in options bits 24–31.
 const HID_TYPE_VELOCITY: u32 = 9;
 const HID_TYPE_DOCK_SWIPE: u32 = 23;
 const fn field(event_type: u32, index: u32) -> u32 {
@@ -41,37 +32,29 @@ const FIELD_VELOCITY_X: u32 = field(HID_TYPE_VELOCITY, 0);
 const FIELD_VELOCITY_Y: u32 = field(HID_TYPE_VELOCITY, 1);
 const FIELD_VELOCITY_Z: u32 = field(HID_TYPE_VELOCITY, 2);
 
-/// kIOHIDGestureFlavorDockPrimary — the flavor Mac Mouse Fix uses for all
-/// three dock-swipe motions.
+/// kIOHIDGestureFlavorDockPrimary — the flavor Mac Mouse Fix uses.
 const FLAVOR_DOCK_PRIMARY: isize = 3;
 
-// kIOHIDEventPhaseBegan/Changed/Ended/Cancelled and
-// kIOHIDEventEventOptionPhaseShift.
+// kIOHIDEventPhaseBegan/Changed/Ended/Cancelled; the shift is kIOHIDEventEventOptionPhaseShift.
 const PHASE_SHIFT: u32 = 24;
 const PHASE_BEGAN: u32 = 1;
 const PHASE_CHANGED: u32 = 2;
 const PHASE_ENDED: u32 = 4;
 const PHASE_CANCELLED: u32 = 8;
 
-/// Type 30 (NSEventTypeMagnify) is the carrier CGEvent type both Mac
-/// Mouse Fix and the verified prototype post DockSwipe events on.
+/// Type 30 (NSEventTypeMagnify), the carrier CGEvent type Mac Mouse Fix posts on.
 const GESTURE_CG_EVENT_TYPE: c_uint = 30;
 /// kCGSessionEventTap.
 const SESSION_EVENT_TAP: c_uint = 1;
 
-/// Mac Mouse Fix: the release velocity is roughly the last frame's delta
-/// × 100 (×50 and ×300 also observed on real events).
+/// Mac Mouse Fix: the release velocity is roughly the last frame's delta × 100.
 const EXIT_VELOCITY_SCALE: f64 = 100.0;
-/// Mac Mouse Fix re-posts the end events at 200 ms and 500 ms — the first
-/// one can be dropped while the system is under load ("stuck bug").
+/// Mac Mouse Fix re-posts the end event — WindowServer can drop the first under load.
 const END_RESEND_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(500)];
 
-/// The running gesture's owner (the capture session that opened it), its
-/// accumulated progress and last delta, and a generation counter that
-/// invalidates pending end-event resends when a new gesture begins. One
-/// stream at a time — the DockSwipe system state is global — so a Began
-/// from a new owner supersedes the previous animation and the previous
-/// owner's later frames are rejected.
+/// The DockSwipe system state is global and single-owner: `owner` isolates
+/// the stream to one capture session, `generation` invalidates pending end
+/// resends when a new gesture begins.
 static STREAM: LazyLock<Mutex<Stream>> = LazyLock::new(|| Mutex::new(Stream::default()));
 
 #[derive(Debug, Default)]
@@ -85,9 +68,7 @@ struct Stream {
 pub(in crate::inject) fn supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        // The class lookup must follow the SkyLight load: the verified
-        // prototype only resolved `HIDEvent` after the framework was
-        // mapped into the process.
+        // HIDEvent only resolves after SkyLight is mapped into the process.
         if NSProcessInfo::processInfo()
             .operatingSystemVersion()
             .majorVersion
@@ -119,8 +100,7 @@ pub(in crate::inject) fn post(
         stream.finish(owner, phase)
     };
     let Some(event_plan) = event_plan else {
-        // Zero-delta continuations are skipped (Mac Mouse Fix skips them
-        // too), and frames from a superseded owner are rejected.
+        // Zero-delta frames and superseded-owner frames post nothing.
         return false;
     };
     drop(stream);
@@ -134,8 +114,7 @@ pub(in crate::inject) fn post(
     posted
 }
 
-/// The IOHIDEventGestureMotion value of a swipe: HorizontalX (1) or
-/// VerticalY (2).
+/// IOHIDGestureMotion values: HorizontalX = 1, VerticalY = 2.
 fn motion_id(motion: DockSwipeMotion) -> isize {
     match motion {
         DockSwipeMotion::Horizontal => 1,
@@ -143,11 +122,8 @@ fn motion_id(motion: DockSwipeMotion) -> isize {
     }
 }
 
-/// Open a gesture as one transaction: the Began event is delivered while
-/// the stream lock is held, and ownership (generation, progress) is
-/// committed only on success. A failed delivery therefore leaves the
-/// previous owner's gesture fully alive — its frames and its end —
-/// instead of stranding it.
+/// Open a gesture transactionally: ownership commits only if the Began
+/// event delivers, so a failed post leaves the previous owner's gesture alive.
 fn post_began(owner: u64, motion: DockSwipeMotion, delta: f64) -> bool {
     let Ok(mut stream) = STREAM.lock() else {
         tracing::warn!("dock swipe stream mutex poisoned");
@@ -158,10 +134,6 @@ fn post_began(owner: u64, motion: DockSwipeMotion, delta: f64) -> bool {
     })
 }
 
-/// The Began transaction: deliver the event, and commit the new owner's
-/// state only on a successful delivery — a failed one leaves the previous
-/// owner's gesture fully alive. Delivery is injected so tests can drive
-/// both outcomes without posting real events.
 fn post_began_with(
     stream: &mut Stream,
     owner: u64,
@@ -177,8 +149,6 @@ fn post_began_with(
     }
 }
 
-/// One ready-to-post event: options bits, accumulated progress, and the
-/// exit velocity attached on end phases.
 #[derive(Clone, Copy)]
 struct EventPlan {
     options: u32,
@@ -188,10 +158,8 @@ struct EventPlan {
 }
 
 impl Stream {
-    /// Plan (without posting or committing) the Began event for `owner`.
+    /// Plan a Began event without changing stream ownership.
     fn began_plan(&self, delta: f64) -> EventPlan {
-        // Mac Mouse Fix's Began carries the stroke's first delta, which seeds
-        // the accumulator.
         EventPlan {
             options: PHASE_BEGAN << PHASE_SHIFT,
             progress: delta,
@@ -200,10 +168,7 @@ impl Stream {
         }
     }
 
-    /// Commit a successfully delivered Began: `owner` takes the stream
-    /// over and the delivered event's progress seeds the accumulator.
-    /// Taking the plan makes an owner/progress mismatch with the
-    /// delivered event unrepresentable.
+    /// Commit a Began plan only after successful delivery.
     fn commit_began(&mut self, owner: u64, plan: &EventPlan) {
         self.owner = owner;
         self.generation = plan.generation;
@@ -211,9 +176,6 @@ impl Stream {
         self.last_delta = plan.progress;
     }
 
-    /// Plan a continuation frame; `None` for zero-delta frames (Mac Mouse Fix
-    /// skips them) and for frames from a superseded owner, whose delivery
-    /// must not touch the new owner's animation.
     fn advance(&mut self, owner: u64, delta: f64) -> Option<EventPlan> {
         if self.owner != owner {
             return None;
@@ -231,10 +193,6 @@ impl Stream {
         })
     }
 
-    /// Plan the end-of-stream event. The release sign rule decides
-    /// commit-vs-spring-back: a release still moving along the accumulated
-    /// travel commits (`ENDED`), one moving against it springs back
-    /// (`CANCELLED`).
     fn finish(&mut self, owner: u64, phase: DockSwipePhase) -> Option<EventPlan> {
         if self.owner != owner {
             return None;
@@ -249,10 +207,7 @@ impl Stream {
     }
 }
 
-/// Commit-vs-spring-back decision for a release, Mac Mouse Fix's rule: a
-/// release still moving along the accumulated travel commits (`ENDED`),
-/// one moving against it springs back (`CANCELLED`), and a release with
-/// no travel or no progress cannot commit anything.
+/// Mac Mouse Fix's release rule: moving with the travel commits, otherwise it springs back.
 fn release_phase(phase: DockSwipePhase, progress: f64, last_delta: f64) -> u32 {
     let commits = match phase {
         DockSwipePhase::Cancel => false,
@@ -271,11 +226,7 @@ fn post_event(motion_id: isize, plan: &EventPlan) -> bool {
         return false;
     };
     autoreleasepool(|_| {
-        // SAFETY: CGEventCreate returns a +1 CFTypeRef, released below.
-        // CGEventCreate(NULL) with no event source is what Mac Mouse Fix
-        // and the verified prototype both post with. Created first so the
-        // HIDEvent can carry the carrier's own timestamp, exactly like
-        // the working mmf27fix shim (CGEventGetTimestamp pass-through).
+        // SAFETY: CGEventCreate(NULL) returns a +1 CGEventRef balanced by CFRelease below.
         let cg_event = unsafe { CGEventCreate(std::ptr::null()) };
         if cg_event.is_null() {
             return false;
@@ -288,9 +239,7 @@ fn post_event(motion_id: isize, plan: &EventPlan) -> bool {
             tracing::warn!("private HIDEvent class unavailable");
             return false;
         };
-        // SAFETY: cg_event is a live +1 CGEventRef; the bridge attaches
-        // the HIDEvent for the event's lifetime; the tap id is the
-        // documented kCGSessionEventTap.
+        // SAFETY: live +1 CGEventRef; the bridge attaches the HIDEvent for the event's lifetime.
         unsafe {
             CGEventSetType(cg_event, GESTURE_CG_EVENT_TYPE);
             (bridge.set_hid_event)(cg_event, Retained::as_ptr(&hid_event).cast());
@@ -314,25 +263,19 @@ fn build_hid_event(
     carrier_timestamp: u64,
 ) -> Option<Retained<AnyObject>> {
     let class = AnyClass::get(c"HIDEvent")?;
-    // SAFETY: HIDEvent responds to `alloc` (+1 result). The class is
-    // opaque, so every exchange below runs on raw pointers.
+    // SAFETY: HIDEvent responds to `alloc` (+1 result); the class is opaque.
     let alloc: *mut AnyObject = unsafe { msg_send![class, alloc] };
     if alloc.is_null() {
         return None;
     }
-    // SAFETY: init-family selector declared on the prototype's HIDEvent
-    // interface as `(uint32_t)type (uint64_t)timestamp (uint64_t)senderID`;
-    // it consumes the alloc's +1 and returns +1 (or nil).
+    // SAFETY: `initWithType:timestamp:senderID:` is `(uint32_t, uint64_t,
+    // uint64_t)` on the prototype's interface; it consumes alloc's +1.
     let event: *mut AnyObject = unsafe {
         msg_send![alloc, initWithType: HID_TYPE_DOCK_SWIPE, timestamp: carrier_timestamp, senderID: 0_u64]
     };
-    // SAFETY: the +1 from the init above transfers into the Retained; the
-    // parent must be owned before any fallible child step, or a failure
-    // below would leak it.
+    // SAFETY: the init's +1 transfers into the Retained before any fallible child step.
     let event: Retained<AnyObject> = unsafe { Retained::from_raw(event) }?;
-    // SAFETY: `setIntegerValue:forField:` is `(NSInteger, uint32_t)` on the
-    // prototype's HIDEvent interface; every selector below is verified
-    // end-to-end by the prototype's payload round-trip.
+    // SAFETY: the setters are `(NSInteger|double, uint32_t)` on the prototype's verified interface.
     unsafe {
         let () = msg_send![&event, setIntegerValue: motion_id, forField: FIELD_DOCK_SWIPE_MOTION];
         let () = msg_send![&event, setIntegerValue: FLAVOR_DOCK_PRIMARY, forField: FIELD_DOCK_SWIPE_FLAVOR];
@@ -342,8 +285,7 @@ fn build_hid_event(
     }
     if let Some(velocity) = plan.velocity {
         let child = velocity_event(velocity, carrier_timestamp)?;
-        // SAFETY: `appendEvent:` takes an object pointer and retains it;
-        // the raw pointer is live for the call's duration.
+        // SAFETY: `appendEvent:` retains the live child pointer for the call's duration.
         unsafe {
             let () = msg_send![&event, appendEvent: Retained::as_ptr(&child)];
         }
@@ -353,37 +295,30 @@ fn build_hid_event(
 
 fn velocity_event(velocity: f64, carrier_timestamp: u64) -> Option<Retained<AnyObject>> {
     let class = AnyClass::get(c"HIDEvent")?;
-    // SAFETY: same opaque alloc/init pair as `build_hid_event`, with the
-    // Velocity event type.
+    // SAFETY: same opaque `alloc` (+1) as `build_hid_event`.
     let alloc: *mut AnyObject = unsafe { msg_send![class, alloc] };
     if alloc.is_null() {
         return None;
     }
-    // SAFETY: init-family selector consumes the alloc's +1 and returns
-    // +1 (or nil).
+    // SAFETY: the init consumes alloc's +1 and returns +1 or nil.
     let event: *mut AnyObject = unsafe {
         msg_send![alloc, initWithType: HID_TYPE_VELOCITY, timestamp: carrier_timestamp, senderID: 0_u64]
     };
     if event.is_null() {
         return None;
     }
-    // SAFETY: `setDoubleValue:forField:` is `(double, uint32_t)` on the
-    // prototype's HIDEvent interface. Real events carry the speed on X
-    // and Y with Z at zero.
+    // SAFETY: `setDoubleValue:forField:` is `(double, uint32_t)`; real events carry speed on X/Y.
     unsafe {
         let () = msg_send![event, setDoubleValue: velocity, forField: FIELD_VELOCITY_X];
         let () = msg_send![event, setDoubleValue: velocity, forField: FIELD_VELOCITY_Y];
         let () = msg_send![event, setDoubleValue: 0.0, forField: FIELD_VELOCITY_Z];
     }
-    // SAFETY: the +1 from the init above transfers into the Retained;
-    // the nil case already returned above.
+    // SAFETY: the init's +1 transfers into the Retained; nil returned above.
     unsafe { Retained::from_raw(event) }
 }
 
-/// Re-post the end event after short delays: Mac Mouse Fix's workaround
-/// for the WindowServer occasionally dropping the first end event under
-/// load ("stuck bug"). A gesture begun in the meantime (generation bump)
-/// cancels the pending resends.
+/// Mac Mouse Fix's workaround for WindowServer dropping the first end event
+/// under load; a newer gesture (generation bump) cancels the resends.
 fn schedule_end_resend(motion_id: isize, plan: EventPlan) {
     let result = std::thread::Builder::new()
         .name("dockswipe-resend".into())
@@ -399,8 +334,6 @@ fn schedule_end_resend(motion_id: isize, plan: EventPlan) {
                     return;
                 }
                 drop(stream);
-                // Resends replay the exact event already decided — no
-                // state mutation.
                 if !post_event(motion_id, &plan) {
                     return;
                 }
@@ -422,9 +355,7 @@ fn sky_light() -> Option<&'static SkyLightBridge> {
             const RTLD_LAZY: c_int = 0x1;
             const SKY_LIGHT: &CStr =
                 c"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight";
-            // SAFETY: `dlopen`/`dlsym` come from libSystem; SKY_LIGHT and
-            // the symbol name are valid C strings. The handle is cached
-            // and intentionally never closed.
+            // SAFETY: `dlopen`/`dlsym` take valid C strings; the handle is never closed.
             let set_hid_event = unsafe {
                 let handle = dlopen(SKY_LIGHT.as_ptr(), RTLD_LAZY);
                 if handle.is_null() {
@@ -437,8 +368,7 @@ fn sky_light() -> Option<&'static SkyLightBridge> {
             }
             Some(SkyLightBridge {
                 set_hid_event: unsafe {
-                    // SAFETY: the symbol, when present, has the documented
-                    // SLEventSetIOHIDEvent(CGEventRef, CFTypeRef) signature.
+                    // SAFETY: the symbol, when present, matches the fn pointer signature below.
                     std::mem::transmute::<
                         *mut c_void,
                         unsafe extern "C" fn(*const c_void, *const c_void),
@@ -478,9 +408,7 @@ mod tests {
         assert!(post_began_with(&mut stream, 1, 0.1, |_| true));
         assert!(stream.advance(1, 0.1).is_some());
 
-        // Owner 2's Began delivery FAILS: nothing commits, so owner 1's
-        // gesture stays alive — its frames and its end still work — while
-        // owner 2's frames stay rejected.
+        // Owner 2's failed Began commits nothing: owner 1 keeps the stream.
         assert!(!post_began_with(&mut stream, 2, 0.2, |_| false));
         assert!(stream.advance(1, -0.05).is_some());
         assert!(stream.finish(1, DockSwipePhase::End).is_some());
@@ -496,7 +424,6 @@ mod tests {
         assert_eq!(stream.owner, 2);
         assert!((stream.progress - 0.2).abs() < 1e-9);
         assert!((stream.last_delta - 0.2).abs() < 1e-9);
-        // The previous owner (1) is rejected after the handover.
         assert!(stream.advance(1, 0.1).is_none());
         assert!(stream.advance(2, 0.1).is_some());
     }

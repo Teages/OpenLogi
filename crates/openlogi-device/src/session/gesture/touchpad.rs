@@ -356,9 +356,7 @@ impl Geometry {
         if info.x_size == 0 || info.y_size == 0 {
             return Err(TouchpadStreamError::EmptyCoordinateRange);
         }
-        // This Casa Touch — the device this feature targets — reports
-        // mapping version 0 while following the expected DualXY layout, so
-        // accept it alongside version 1 instead of failing capture arming.
+        // Casa Touch reports mapping version 0 with the same observed DualXY layout as version 1.
         if !matches!(info.raw_report_mapping_version, 0 | 1) {
             return Err(TouchpadStreamError::UnsupportedMapping(
                 info.raw_report_mapping_version,

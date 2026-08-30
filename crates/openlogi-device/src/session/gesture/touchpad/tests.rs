@@ -41,8 +41,7 @@ fn raw_mode_responder(request: &[u8]) -> Option<Vec<u8>> {
     }
     let mut payload = [0u8; 3];
     match (request[2], request[3] >> 4) {
-        // `get_touchpad_info` (fn 0): a 16-byte payload whose byte 12 is the
-        // raw-report mapping version, answered with a long frame.
+        // `get_touchpad_info` (fn 0) answers a 16-byte payload; byte 12 is the mapping version.
         (TOUCHPAD_INDEX, 0x00) => {
             let mut info = [0u8; 16];
             info[0..2].copy_from_slice(&2_775_u16.to_be_bytes());
@@ -723,8 +722,6 @@ fn abnormal_device_timestamp_gap_ends_before_the_next_frame() {
 
 #[tokio::test]
 async fn geometry_accepts_mapping_versions_0_and_1_and_rejects_others() {
-    // Regression pin for the Casa Touch: the pad this feature targets
-    // reports mapping version 0 while following the standard DualXY layout.
     let info = |feature: TouchpadRawXyFeature| async move {
         feature
             .get_touchpad_info()

@@ -13,8 +13,6 @@ fn frame(timestamp_us: u64, contacts: Vec<TouchContact>) -> TouchFrame {
     TouchFrame::new(timestamp_us, false, contacts).expect("test contacts have unique ids")
 }
 
-/// Three- or four-finger stroke moving right, the same shape the core
-/// recognizer tests use to commit a swipe.
 fn translated_frame(
     timestamp_us: u64,
     count: u8,
@@ -189,10 +187,6 @@ fn native_swipe_streams_progress_instead_of_dispatching() {
         runtime.update(&translated_frame(0, 3, 0, 0), &bindings, true, true),
         idle()
     );
-    // The commit frame only seeds the stream; the animation opens on the
-    // first frame with actual travel, whose delta becomes the Began progress
-    // (the vertical consumer ignores a zero-progress Began). The discrete
-    // action stays suppressed either way — the ended DockSwipe event commits.
     assert_eq!(
         runtime.update(
             &translated_frame(60_000, 3, 15_000, 0),
@@ -254,9 +248,6 @@ fn left_swipes_stream_negative_progress() {
         true,
     );
 
-    // Fingers moving left are negative travel and must render as negative
-    // progress — the hardware-verified system convention (positive progress
-    // is rightward content travel).
     let outcome = runtime.update(
         &translated_frame(90_000, 3, -25_000, 0),
         &bindings,
@@ -303,9 +294,6 @@ fn vertical_up_swipes_stream_positive_progress() {
         true,
     );
 
-    // An upward Mission Control pull streams positive progress: the y axis
-    // grows downward, so the vertical delta negates dy. The first traveling
-    // frame opens the stream with its delta as the Began progress.
     let outcome = runtime.update(
         &translated_frame(90_000, 3, 0, -25_000),
         &bindings,
@@ -365,8 +353,6 @@ fn vertical_down_swipes_stream_negative_progress() {
 
 #[test]
 fn cross_axis_binding_keeps_discrete_dispatch() {
-    // A vertical action on a horizontal trigger has no matching animation;
-    // the discrete hotkey is the only honest dispatch.
     let trigger = ButtonId::TouchpadThreeFingerSwipeRight;
     let bindings = BTreeMap::from([(trigger, Action::MissionControl)]);
     let mut runtime = TouchpadRuntime::default();
@@ -395,8 +381,6 @@ fn dropped_frame_cancel_keeps_the_stream_running() {
         true,
     );
 
-    // A liftoff or mid-stroke drop surfaces as TouchpadCancel while the
-    // stroke continues, so the animation must survive it.
     runtime.cancel();
     let outcome = runtime.update(
         &translated_frame(90_000, 4, 25_000, 0),
@@ -429,8 +413,7 @@ fn contact_set_change_does_not_jump_progress() {
         true,
     );
 
-    // One finger lifts: the centroid moves, but the stroke was rebased, so
-    // this frame must not stream a phantom delta.
+    // Dropping contact 3 rebases the centroid without emitting progress.
     let rebased = frame(
         90_000,
         vec![contact(1, 65_000, 50_000), contact(2, 75_000, 50_000)],
@@ -438,8 +421,6 @@ fn contact_set_change_does_not_jump_progress() {
     let outcome = runtime.update(&rebased, &bindings, true, true);
     assert_eq!(outcome.stream, SwipeOutput::Idle);
 
-    // The next frame with the new contact set opens the stream (it is still
-    // latent) from the new baseline.
     let moved = frame(
         120_000,
         vec![contact(1, 70_000, 50_000), contact(2, 80_000, 50_000)],
@@ -484,8 +465,6 @@ fn session_teardown_cancels_the_running_animation() {
 
 #[test]
 fn unopened_stream_ends_silently() {
-    // A stroke that commits but never travels past the opening frame posted
-    // no Began, so its end must not post a Finish either.
     let trigger = ButtonId::TouchpadThreeFingerSwipeRight;
     let bindings = BTreeMap::from([(trigger, Action::NextDesktop)]);
     let mut runtime = TouchpadRuntime::default();
@@ -549,11 +528,8 @@ fn begin_failure_falls_back_to_discrete_action() {
         true,
     );
 
-    // The Began post failed: the stream closes and commit's suppressed
-    // action is returned for dispatch, per the API fallback contract.
     assert_eq!(runtime.begin_failed(), Some((trigger, Action::NextDesktop)));
 
-    // Closed: later frames and the stroke end post nothing.
     let outcome = runtime.update(
         &translated_frame(120_000, 3, 30_000, 0),
         &bindings,

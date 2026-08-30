@@ -123,10 +123,7 @@ impl TouchpadRuntime {
             {
                 if let Some((trigger, action)) = self.action(trigger) {
                     match (native_streaming, native_stream_plan(trigger, &action)) {
-                        // The ended DockSwipe event itself commits the system
-                        // action, so the discrete dispatch is suppressed. The
-                        // stream opens on the first frame with actual travel,
-                        // not at commit.
+                        // DockSwipe End commits the action; Began waits for first non-zero travel.
                         (true, Some(motion)) => {
                             self.stream = Some(ActiveSwipe::new(frame, motion, (trigger, action)));
                         }
@@ -161,19 +158,15 @@ impl TouchpadRuntime {
         TouchpadOutcome { action, stream }
     }
 
-    /// Cancel the stroke on a mid-stream `TouchpadCancel` event. Dropped-frame
-    /// cancels are emitted while the stroke continues (and at every >2-contact
-    /// liftoff on this pad), so a running animation deliberately keeps
-    /// streaming through them; the real stroke end still arrives as
-    /// `TouchpadEnd`.
+    /// Cancel the stroke but not a running animation: dropped-frame cancels
+    /// fire mid-stroke, and the real end still arrives as `TouchpadEnd`.
     fn cancel(&mut self) {
         self.recognizer.cancel();
         self.frozen_bindings = None;
         self.frozen_actions_enabled = false;
     }
 
-    /// Session teardown: the animation must spring back instead of hanging.
-    /// A stream that never opened never posted anything, so it ends silently.
+    /// Spring back an opened animation; unopened streams remain silent.
     fn terminate(&mut self) -> SwipeOutput {
         self.cancel();
         self.stream
@@ -181,9 +174,7 @@ impl TouchpadRuntime {
             .map_or(SwipeOutput::Idle, |swipe| swipe.finish(SwipeEnd::Cancelled))
     }
 
-    /// The Began post failed: per the API contract the stream closes without
-    /// posting anything, and the discrete action that commit suppressed is
-    /// returned for dispatch.
+    /// Close the failed stream and recover its suppressed discrete action.
     fn begin_failed(&mut self) -> Option<(ButtonId, Action)> {
         self.stream.take().map(|swipe| swipe.fallback)
     }
@@ -197,51 +188,42 @@ impl TouchpadRuntime {
     }
 }
 
-/// What the dispatcher must execute after one touchpad runtime step.
 #[derive(Debug, Default, PartialEq)]
 struct TouchpadOutcome {
     action: Option<(ButtonId, Action)>,
     stream: SwipeOutput,
 }
 
-/// One native DockSwipe animation command for the injector.
 #[derive(Debug, Default, PartialEq)]
 enum SwipeOutput {
     #[default]
     Idle,
-    /// Begin the animation for `motion`; `progress` seeds the accumulated
-    /// progress with the opening frame's travel, and later frames stream
-    /// increments.
+    /// `progress` is the opening frame's travel; later frames stream deltas.
     Begin {
         motion: DockSwipeMotion,
         progress: f64,
     },
-    /// Feed one frame's normalized progress delta to the running animation.
-    Advance { motion: DockSwipeMotion, delta: f64 },
-    /// Finish the running animation.
+    Advance {
+        motion: DockSwipeMotion,
+        delta: f64,
+    },
     Finish {
         motion: DockSwipeMotion,
         end: SwipeEnd,
     },
 }
 
-/// How a streamed swipe ends: at finger release the injector's sign rule
-/// decides commit-vs-spring-back, an abort always springs back.
+/// Release lets the injector's sign rule commit or spring back; an abort always springs back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwipeEnd {
     AtRelease,
     Cancelled,
 }
 
-/// One running native animation: the committed swipe's motion, whether its
-/// Began has been sent, and the last frame's contact set and centroid so
-/// progress deltas skip rebased strokes (finger landings/lifts) instead of
-/// jumping.
 struct ActiveSwipe {
     motion: DockSwipeMotion,
     opened: bool,
-    /// The discrete action suppressed at commit, dispatched if the Began
-    /// post fails.
+    /// The action suppressed at commit, dispatched if Began fails.
     fallback: (ButtonId, Action),
     contact_ids: Box<[u8]>,
     centroid_um: (i64, i64),
@@ -258,8 +240,7 @@ impl ActiveSwipe {
         }
     }
 
-    /// End-of-stream command: an unopened stream posted nothing and ends
-    /// silently.
+    /// An unopened stream posted nothing, so it ends without a Finish.
     fn finish(self, end: SwipeEnd) -> SwipeOutput {
         if self.opened {
             SwipeOutput::Finish {
@@ -271,11 +252,7 @@ impl ActiveSwipe {
         }
     }
 
-    /// The stream step for `frame`, or `None` when nothing should be posted.
-    ///
-    /// The first frame with actual travel opens the stream: its delta seeds
-    /// the Began progress, because the vertical consumer ignores a gesture
-    /// whose Began carries zero progress. Later frames stream increments.
+    /// Defer Began until non-zero travel because vertical DockSwipe ignores zero-progress Began.
     #[expect(
         clippy::cast_precision_loss,
         reason = "centroid deltas are bounded by the pad size; f64 precision is ample"
@@ -289,9 +266,7 @@ impl ActiveSwipe {
                 centroid.0 - self.centroid_um.0,
                 centroid.1 - self.centroid_um.1,
             );
-            // Progress follows the physical axes: horizontal takes dx as-is,
-            // vertical negates dy (y grows downward) so an upward Mission
-            // Control pull streams positive progress.
+            // Window y grows downward, but vertical DockSwipe progress is positive upward.
             let raw = match self.motion {
                 DockSwipeMotion::Horizontal => dx,
                 DockSwipeMotion::Vertical => -dy,
@@ -321,24 +296,14 @@ impl ActiveSwipe {
     }
 }
 
-/// One full pad-width of finger travel equals one unit of DockSwipe progress,
-/// so a stroke across the whole pad animates one full Space — the native
-/// trackpad feel. Frames carry micrometres but not the pad's physical size,
-/// and the PR's target pad is 2775 × 1786 units at 600 dpi (≈117 × 76 mm),
-/// so the travel constants mirror that pad; other pads scale approximately
-/// until real geometry is plumbed through.
+/// One pad-width of travel equals one progress unit; the constants mirror the
+/// target Casa Touch pad (2775 × 1786 @ 600 dpi ≈ 117 × 76 mm) until real
+/// geometry is plumbed through.
 const HORIZONTAL_PAD_TRAVEL_UM: f64 = 117_000.0;
 const VERTICAL_PAD_TRAVEL_UM: f64 = 75_600.0;
 
-/// Which native animation a committed swipe trigger drives. `None` keeps the
-/// discrete dispatch — including when the bound action lives on the other
-/// axis, where the animation would perform a different gesture than the
-/// binding names.
-///
-/// Progress signs are deliberately **not** per trigger direction: they follow
-/// the physical axis (fingers right/up stream positive, left/down negative),
-/// so mid-stroke reversals render physically — the natural-scrolling feel,
-/// hardware-verified against the working Mac Mouse Fix implementation.
+/// Stream a committed swipe only when the bound action lives on the trigger's
+/// axis; anything else keeps the discrete dispatch.
 fn native_stream_plan(trigger: ButtonId, action: &Action) -> Option<DockSwipeMotion> {
     let motion = match trigger {
         ButtonId::TouchpadThreeFingerSwipeRight
@@ -379,16 +344,12 @@ impl SessionTouchpads {
         self.0.entry(session.clone()).or_default()
     }
 
-    /// The Began post failed for `session`'s stream: close it and surface the
-    /// suppressed discrete action.
     fn begin_failed(&mut self, session: &HidppSessionId) -> Option<(ButtonId, Action)> {
         self.0
             .get_mut(session)
             .and_then(TouchpadRuntime::begin_failed)
     }
 
-    /// Drop one session's runtime, returning the animation command its
-    /// teardown must execute.
     fn cancel_session(&mut self, session: &HidppSessionId) -> SwipeOutput {
         self.0
             .remove(session)
@@ -602,8 +563,6 @@ impl InputDispatcher {
                 ) {
                     debug!(key, ?motion, "touchpad swipe → native DockSwipe animation");
                 } else {
-                    // Per the API contract: close the stream and fall back to
-                    // the discrete action that commit suppressed.
                     tracing::warn!(key, ?motion, "native dock swipe failed to begin");
                     if let Some((trigger, action)) = touchpads.begin_failed(session) {
                         debug!(key, %trigger, action = %action.label(), "touchpad swipe → discrete fallback");
@@ -620,9 +579,7 @@ impl InputDispatcher {
         outputs.actions.dispatch(action, Some(key));
     }
 
-    /// Forward one native-animation command to the injector. The owner id
-    /// scopes the stream to this capture session, so a second touchpad's
-    /// gestures can never advance or finish another session's animation.
+    /// Use the capture-session epoch as the global DockSwipe owner.
     fn execute_touchpad_stream(owner: u64, stream: &SwipeOutput, key: &str) {
         match *stream {
             SwipeOutput::Idle => {}
