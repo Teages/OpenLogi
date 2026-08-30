@@ -275,3 +275,46 @@ fn touchpad_scroll_survives_disabled_actions_and_cancels_cleanly() {
     );
     assert_eq!(runtime.cancel(), TouchpadOutput::Idle);
 }
+
+#[test]
+fn touchpad_scroll_tuning_scales_and_inverts_content_deltas() {
+    use openlogi_core::config::TouchpadScrollSensitivity;
+
+    fn tuning(sensitivity: TouchpadScrollSensitivity, inverted: bool) -> TouchpadScrollTuning {
+        TouchpadScrollTuning::from_plan(&DispatchPlan {
+            config_key: "casa".to_string(),
+            bindings: BTreeMap::new(),
+            gesture_bindings: BTreeMap::new(),
+            side_gesture_bindings: BTreeMap::new(),
+            thumbwheel_sensitivity: ThumbwheelSensitivity::DEFAULT,
+            touchpad_bindings: BTreeMap::new(),
+            touchpad_scroll_sensitivity: sensitivity,
+            touchpad_scroll_inverted: inverted,
+        })
+    }
+    fn assert_pixels(delta: openlogi_core::scroll::ScrollDelta, x: f64, y: f64) {
+        assert!((delta.x() - x).abs() < 1e-9, "x: {}", delta.x());
+        assert!((delta.y() - y).abs() < 1e-9, "y: {}", delta.y());
+    }
+
+    // Neutral tuning keeps the base 25 px/mm gain with the content-following
+    // axis mapping (horizontal negated, vertical as-is).
+    assert_pixels(
+        tuning(TouchpadScrollSensitivity::DEFAULT, false).content_delta(1_000, 2_000),
+        -25.0,
+        50.0,
+    );
+    // Doubling the sensitivity doubles both axes.
+    let doubled = TouchpadScrollSensitivity::try_new(28).expect("valid sensitivity");
+    assert_pixels(
+        tuning(doubled, false).content_delta(1_000, 2_000),
+        -50.0,
+        100.0,
+    );
+    // Inversion flips both axes on top of the gain.
+    assert_pixels(
+        tuning(TouchpadScrollSensitivity::DEFAULT, true).content_delta(1_000, 2_000),
+        25.0,
+        -50.0,
+    );
+}

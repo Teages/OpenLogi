@@ -13,7 +13,7 @@ use openlogi_inject::SmoothScrollPhase;
 use tracing::debug;
 
 use self::wheel::{ScrollScale, WheelAccumulators, WheelOutput, WheelRotation};
-use super::GestureOutputs;
+use super::{GestureOutputs, TouchpadScrollTuning};
 use crate::capture_plan::DispatchPlan;
 use crate::runtime::{HidppSessionId, PressToken};
 
@@ -245,7 +245,12 @@ impl InputDispatcher {
         self.wheels.cancel_session(session);
         self.gesture_presses.cancel_session(session);
         if let Some(outcome) = self.touchpads.cancel_session(session) {
-            Self::route_touchpad_output(&self.outputs, session.device_key(), outcome);
+            Self::route_touchpad_output(
+                &self.outputs,
+                TouchpadScrollTuning::NEUTRAL,
+                session.device_key(),
+                outcome,
+            );
         }
     }
 
@@ -327,23 +332,26 @@ impl InputDispatcher {
                 }
             }
             CapturedInput::TouchpadFrame(frame) => {
+                let tuning = TouchpadScrollTuning::from_plan(plan);
                 let outcome = self.touchpads.for_session(session).update(
                     &frame,
                     &plan.touchpad_bindings,
                     touchpad_actions_enabled,
                 );
-                Self::route_touchpad_output(&self.outputs, key, outcome);
+                Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
             }
             CapturedInput::TouchpadEnd => {
+                let tuning = TouchpadScrollTuning::from_plan(plan);
                 let outcome = self
                     .touchpads
                     .for_session(session)
                     .end(touchpad_actions_enabled);
-                Self::route_touchpad_output(&self.outputs, key, outcome);
+                Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
             }
             CapturedInput::TouchpadCancel => {
+                let tuning = TouchpadScrollTuning::from_plan(plan);
                 let outcome = self.touchpads.for_session(session).cancel();
-                Self::route_touchpad_output(&self.outputs, key, outcome);
+                Self::route_touchpad_output(&self.outputs, tuning, key, outcome);
             }
             CapturedInput::TouchpadDroppedFrames(_) => {}
         }
@@ -395,7 +403,12 @@ impl InputDispatcher {
             .dispatch_hidpp_button_pulse(session, button, binding);
     }
 
-    fn route_touchpad_output(outputs: &GestureOutputs, key: &str, outcome: TouchpadOutput) {
+    fn route_touchpad_output(
+        outputs: &GestureOutputs,
+        tuning: TouchpadScrollTuning,
+        key: &str,
+        outcome: TouchpadOutput,
+    ) {
         match outcome {
             TouchpadOutput::Idle => {}
             TouchpadOutput::Action { trigger, action } => {
@@ -406,7 +419,7 @@ impl InputDispatcher {
                 dx_um,
                 dy_um,
                 phase,
-            } => super::post_touchpad_scroll(dx_um, dy_um, phase),
+            } => super::post_touchpad_scroll(tuning, dx_um, dy_um, phase),
         }
     }
 }
