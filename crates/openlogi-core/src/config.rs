@@ -37,7 +37,8 @@ pub use settings::LightSettings;
 pub use settings::{
     AppIcon, AppSettings, Appearance, AssetSourcePreference, CameraControls, DeviceViewMode,
     Lighting, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution,
-    SmartShift, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity, WheelMode,
+    SmartShift, ThumbwheelSensitivity, TouchpadScrollSensitivity, UiScale,
+    VerticalScrollSensitivity, WheelMode,
 };
 
 use crate::binding::{
@@ -51,6 +52,9 @@ use settings::GestureOwner;
 /// The schema version the current build produces. Bumped whenever the
 /// persisted shape or enum vocabulary changes; readers inspect this value
 /// before consuming the rest of the file.
+///
+/// v8 adds an optional per-device touchpad scroll-sensitivity override inside
+/// the v7 touchpad gesture settings (absent fields keep the default speed).
 ///
 /// v7 adds default-disabled raw-touchpad gesture settings and 15 append-only
 /// touchpad trigger identifiers.
@@ -92,7 +96,7 @@ use settings::GestureOwner;
 /// next save; [`Config::load_from_path`] accepts supported versions `1` through
 /// [`SCHEMA_VERSION`] so an invalid or forward file fails loudly instead of
 /// silently losing bindings.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Returned when a touchpad-only config API receives another kind of trigger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -685,6 +689,33 @@ impl Config {
             .or_default()
             .touchpad_gestures
             .enabled = enabled;
+    }
+
+    /// The effective two-finger scroll speed for `device_key`'s synthesized
+    /// touchpad scrolling: the device's override when set, else the
+    /// out-of-the-box speed.
+    #[must_use]
+    pub fn touchpad_scroll_sensitivity(
+        &self,
+        device_key: &str,
+    ) -> settings::TouchpadScrollSensitivity {
+        self.devices
+            .get(device_key)
+            .and_then(|d| d.touchpad_gestures.scroll_sensitivity)
+            .unwrap_or_default()
+    }
+
+    /// Set (or clear, with `None`) `device_key`'s two-finger scroll speed.
+    pub fn set_touchpad_scroll_sensitivity(
+        &mut self,
+        device_key: &str,
+        sensitivity: Option<settings::TouchpadScrollSensitivity>,
+    ) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .touchpad_gestures
+            .scroll_sensitivity = sensitivity;
     }
 
     /// Enable or disable ring hover and activation haptics.
