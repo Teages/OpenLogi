@@ -667,12 +667,12 @@ pub(super) fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     };
     let delta = quantizer.quantize(delta, units_per_input);
     drop(quantizer);
-    post_continuous_scroll(delta, phase);
+    post_continuous_scroll(delta, Some(phase));
 }
 
 /// Synthesise one frame of a touchpad scroll after honouring the user's
 /// natural-scrolling preference (see [`super::post_touchpad_scroll`]).
-pub(super) fn post_touchpad_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
+pub(super) fn post_touchpad_scroll(delta: ScrollDelta, phase: Option<SmoothScrollPhase>) {
     let delta = orient_by_scroll_preference(delta);
     let Ok(mut quantizer) = TOUCHPAD_SCROLL_QUANTIZER.lock() else {
         tracing::warn!("macOS touchpad scroll quantizer mutex poisoned");
@@ -680,10 +680,13 @@ pub(super) fn post_touchpad_scroll(delta: ScrollDelta, phase: SmoothScrollPhase)
     };
     let delta = quantizer.quantize(delta, 1.0);
     drop(quantizer);
+    if phase.is_none() && delta == QuantizedScroll::default() {
+        return;
+    }
     post_continuous_scroll(delta, phase);
 }
 
-fn post_continuous_scroll(delta: QuantizedScroll, phase: SmoothScrollPhase) {
+fn post_continuous_scroll(delta: QuantizedScroll, phase: Option<SmoothScrollPhase>) {
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         tracing::warn!("CGEventSource::new failed for smooth scroll");
         return;
@@ -694,7 +697,9 @@ fn post_continuous_scroll(delta: QuantizedScroll, phase: SmoothScrollPhase) {
         return;
     };
     set_continuous_scroll_fields(&ev, delta);
-    ev.set_integer_value_field(SCROLL_PHASE, scroll_phase_value(phase));
+    if let Some(phase) = phase {
+        ev.set_integer_value_field(SCROLL_PHASE, scroll_phase_value(phase));
+    }
     ev.set_integer_value_field(MOMENTUM_PHASE, 0);
     tag_synthetic(&ev);
     ev.post(CGEventTapLocation::HID);

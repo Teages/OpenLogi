@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use openlogi_core::scroll::ScrollDelta;
-use openlogi_inject::SmoothScrollPhase;
 
 use super::super::TouchpadScrollTuning;
 
@@ -88,12 +87,11 @@ fn run(velocity: &mut (f64, f64), stop: &AtomicBool) {
     loop {
         // The per-tick distance comes from the velocity *before* the decay,
         // matching the Options+ tick shape (velocity is per-tick distance
-        // divided by the tick length). These continue the stroke's own
-        // Began/Changed stream; the dispatcher skips its terminal when a
-        // tail starts, so phases stay monotonic.
+        // divided by the tick length). Wheel-class frames need no phase
+        // closure: the stream ends by simply stopping.
         openlogi_inject::post_touchpad_scroll(
             ScrollDelta::pixels(velocity.0 * TICK_SECONDS, velocity.1 * TICK_SECONDS),
-            SmoothScrollPhase::Changed,
+            None,
         );
         ticks += 1;
 
@@ -109,7 +107,6 @@ fn run(velocity: &mut (f64, f64), stop: &AtomicBool) {
         velocity.1 *= scale;
         std::thread::sleep(TICK);
     }
-    openlogi_inject::post_touchpad_scroll(ScrollDelta::pixels(0.0, 0.0), SmoothScrollPhase::Ended);
     tracing::debug!(
         ticks,
         speed = speed(*velocity),

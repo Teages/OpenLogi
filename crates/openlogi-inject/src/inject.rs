@@ -448,8 +448,11 @@ const PIXELS_PER_WHEEL_TICK: f64 = 10.0;
 /// re-orients synthesized ones here; wheel-class platforms let the desktop
 /// apply that preference itself and only need the distance, as wheel ticks.
 /// Non-finite input is rejected; zero-distance frames stay meaningful as
-/// gesture-phase terminators.
-pub fn post_touchpad_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
+/// gesture-phase terminators. `None` posts the frame wheel-class — no scroll
+/// phase — which apps clamp at document boundaries instead of rubber-banding
+/// the way an in-progress drag does; that is the shape the pad's own firmware
+/// uses for its native glide.
+pub fn post_touchpad_scroll(delta: ScrollDelta, phase: Option<SmoothScrollPhase>) {
     if !delta.is_finite() {
         return;
     }

@@ -87,7 +87,7 @@ impl GestureOutputs {
 /// firmware scroll translation off — OpenLogi restores the scrolling itself,
 /// the contract Options+ keeps on the same hardware.
 fn post_touchpad_scroll(tuning: TouchpadScrollTuning, dx: i64, dy: i64, phase: SmoothScrollPhase) {
-    openlogi_inject::post_touchpad_scroll(tuning.content_delta(dx, dy), phase);
+    openlogi_inject::post_touchpad_scroll(tuning.content_delta(dx, dy), Some(phase));
 }
 
 /// Effective tuning of one device's synthesized two-finger scrolling.
