@@ -667,7 +667,7 @@ pub(super) fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     };
     let delta = quantizer.quantize(delta, units_per_input);
     drop(quantizer);
-    post_continuous_scroll(delta, scroll_phase_value(phase), 0);
+    post_continuous_scroll(delta, scroll_phase_value(phase), 0, CGEventTapLocation::HID);
 }
 
 /// Synthesise one frame of a touchpad scroll after honouring the user's
@@ -680,7 +680,7 @@ pub(super) fn post_touchpad_scroll(delta: ScrollDelta, phase: SmoothScrollPhase)
     };
     let delta = quantizer.quantize(delta, 1.0);
     drop(quantizer);
-    post_continuous_scroll(delta, scroll_phase_value(phase), 0);
+    post_continuous_scroll(delta, scroll_phase_value(phase), 0, CGEventTapLocation::HID);
 }
 
 /// Synthesise one frame of touchpad scroll *momentum* — the decaying tail a
@@ -695,10 +695,25 @@ pub(super) fn post_touchpad_momentum_scroll(delta: ScrollDelta, phase: MomentumS
     };
     let delta = quantizer.quantize(delta, 1.0);
     drop(quantizer);
-    post_continuous_scroll(delta, 0, momentum_phase_value(phase));
+    // Momentum rides the session tap: the HID layer re-interprets
+    // device-class scroll input and drops the momentum phase, while the
+    // session level hands the event to apps as-is (the posting level Mac
+    // Mouse Fix ships its synthesized momentum on). Our hook taps HID, so
+    // these never feed back.
+    post_continuous_scroll(
+        delta,
+        0,
+        momentum_phase_value(phase),
+        CGEventTapLocation::Session,
+    );
 }
 
-fn post_continuous_scroll(delta: QuantizedScroll, scroll_phase: i64, momentum_phase: i64) {
+fn post_continuous_scroll(
+    delta: QuantizedScroll,
+    scroll_phase: i64,
+    momentum_phase: i64,
+    tap: CGEventTapLocation,
+) {
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         tracing::warn!("CGEventSource::new failed for smooth scroll");
         return;
@@ -712,7 +727,7 @@ fn post_continuous_scroll(delta: QuantizedScroll, scroll_phase: i64, momentum_ph
     ev.set_integer_value_field(SCROLL_PHASE, scroll_phase);
     ev.set_integer_value_field(MOMENTUM_PHASE, momentum_phase);
     tag_synthetic(&ev);
-    ev.post(CGEventTapLocation::HID);
+    ev.post(tap);
 }
 
 /// How long a natural-scrolling preference read stays valid: long enough that
